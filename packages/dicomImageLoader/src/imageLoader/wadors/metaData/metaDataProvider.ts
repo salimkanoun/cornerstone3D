@@ -1,4 +1,3 @@
-import * as dicomParser from 'dicom-parser';
 import {
   Enums,
   utilities,
@@ -11,6 +10,7 @@ import metaDataManager, {
   retrieveMultiframeMetadataImageId,
 } from '../metaDataManager';
 import getValue from './getValue';
+import getSequenceItems from './getSequenceItems';
 import {
   getMultiframeInformation,
   getFrameInformation,
@@ -21,12 +21,12 @@ import {
 } from './extractPositioningFromMetadata';
 import { getImageTypeSubItemFromMetadata } from './NMHelpers';
 import isNMReconstructable from '../../isNMReconstructable';
-import {
-  getInstanceModule,
-  instanceModuleNames,
-} from '../../getInstanceModule';
+import { instanceModuleNames } from '../../getInstanceModule';
 import { getUSEnhancedRegions } from './USHelpers';
 
+/**
+ * @deprecated Use addDicomWebInstance from @cornerstonejs/metadata instead.
+ */
 function metaDataProvider(type, imageId) {
   const { MetadataModules } = Enums;
 
@@ -258,11 +258,17 @@ function metaDataProvider(type, imageId) {
   }
 
   if (type === MetadataModules.VOI_LUT) {
+    // Passed through as raw DICOMweb JSON items - createImage normalizes the
+    // LUT Descriptor/LUT Data into the shape the renderers use. Items whose LUT
+    // Data is only a BulkDataURI cannot be resolved here (that needs an async
+    // fetch) and are dropped by the normalizer.
+    const voiLUTSequence = getSequenceItems(metaData['00283010']);
+
     return {
       windowCenter: getNumberValues(metaData['00281050'], 1),
       windowWidth: getNumberValues(metaData['00281051'], 1),
       voiLUTFunction: getValue(metaData['00281056']),
-      // TODO VOT LUT Sequence
+      voiLUTSequence: voiLUTSequence.length ? voiLUTSequence : undefined,
     };
   }
 

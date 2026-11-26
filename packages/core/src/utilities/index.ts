@@ -1,22 +1,30 @@
 import * as eventListener from './eventListener';
 import csUtils from './invertRgbTransferFunction';
 import createSigmoidRGBTransferFunction from './createSigmoidRGBTransferFunction';
+import createVOILUTSequenceTransferFunction from './createVOILUTSequenceTransferFunction';
 import getVoiFromSigmoidRGBTransferFunction from './getVoiFromSigmoidRGBTransferFunction';
 import createLinearRGBTransferFunction from './createLinearRGBTransferFunction';
 import scaleRgbTransferFunction from './scaleRgbTransferFunction';
 import triggerEvent from './triggerEvent';
 import uuidv4 from './uuidv4';
 import getMinMax from './getMinMax';
+import clonePoint3 from './clonePoint3';
+import hasOwn from './hasOwn';
 import getRuntimeId from './getRuntimeId';
+import getVOIRangeFromWindowLevel from './getVOIRangeFromWindowLevel';
 import imageIdToURI from './imageIdToURI';
 import calibratedPixelSpacingMetadataProvider from './calibratedPixelSpacingMetadataProvider';
 import clamp from './clamp';
 import isOpposite from './isOpposite';
 import getClosestImageId from './getClosestImageId';
 import getSpacingInNormalDirection from './getSpacingInNormalDirection';
+import getEffectiveSpacingAlongDirection from './getEffectiveSpacingAlongDirection';
+import sampleVolumeGrid from './sampleVolumeGrid';
+import getViewSlabDepth from './getViewSlabDepth';
 import getTargetVolumeAndSpacingInNormalDir from './getTargetVolumeAndSpacingInNormalDir';
 import getVolumeActorCorners from './getVolumeActorCorners';
 import indexWithinDimensions from './indexWithinDimensions';
+import indexAlmostWithinDimensions from './indexAlmostWithinDimensions';
 import getVolumeViewportsContainingSameVolumes from './getVolumeViewportsContainingSameVolumes';
 import getViewportsWithVolumeId from './getViewportsWithVolumeId';
 import transformWorldToIndex, {
@@ -56,20 +64,35 @@ import { updateVTKImageDataWithCornerstoneImage } from './updateVTKImageDataWith
 import ProgressiveIterator from './ProgressiveIterator';
 import decimate from './decimate';
 import imageRetrieveMetadataProvider from './imageRetrieveMetadataProvider';
+import genericViewportDisplaySetMetadataProvider from './genericViewportDisplaySetMetadataProvider';
 import isVideoTransferSyntax from './isVideoTransferSyntax';
 import { getBufferConfiguration } from './getBufferConfiguration';
 import { generateVolumePropsFromImageIds } from './generateVolumePropsFromImageIds';
 import { convertStackToVolumeViewport } from './convertStackToVolumeViewport';
 import { convertVolumeToStackViewport } from './convertVolumeToStackViewport';
 import VoxelManager from './VoxelManager';
+import CompositeVoxelManager from './CompositeVoxelManager';
 import RLEVoxelMap from './RLEVoxelMap';
-import roundNumber, { roundToPrecision } from './roundNumber';
+import roundNumber, { roundNumberTrim, roundToPrecision } from './roundNumber';
 import convertToGrayscale from './convertToGrayscale';
+import { convertColorArrayToRgbString } from './convertColorArrayToRgbString';
 import getViewportImageIds from './getViewportImageIds';
 import { getRandomSampleFromArray } from './getRandomSampleFromArray';
 import { getVolumeId } from './getVolumeId';
 import { hasFloatScalingParameters } from './hasFloatScalingParameters';
+import { getScalingMode } from './getScalingMode';
 import { pointInShapeCallback } from './pointInShapeCallback';
+import * as ECGUtilitiesModule from './ECGUtilities';
+import * as VideoUtilities from './VideoUtilities';
+import * as WSIUtilities from './WSIUtilities';
+import * as voxelGrid from './voxelGrid';
+
+/**
+ * @deprecated Kept for 5.x compatibility. Use the ECG functions of
+ * `GenericViewport/ECG`, for example `getECGTraceLayout`. The next major
+ * release removes it.
+ */
+const ECGUtilities = ECGUtilitiesModule;
 // name spaces
 export * as planar from './planar';
 import * as windowLevel from './windowLevel';
@@ -85,6 +108,8 @@ import { buildMetadata } from './buildMetadata';
 
 // solving the circular dependency issue
 import { _getViewportModality } from './getViewportModality';
+import { _getScalingDescriptor } from './getScalingDescriptor';
+import { resolveGenericViewportVolumeId } from './resolveGenericViewportVolumeId';
 import cache from '../cache/cache';
 import getDynamicVolumeInfo from './getDynamicVolumeInfo';
 import autoLoad from './autoLoad';
@@ -98,16 +123,67 @@ import { jumpToSlice } from './jumpToSlice';
 import scroll from './scroll';
 import clip from './clip';
 import createSubVolume from './createSubVolume';
+import getAcquisitionPlaneOrientation from './getAcquisitionPlaneOrientation';
 import getVolumeDirectionVectors from './getVolumeDirectionVectors';
+import getVolumeViewReferenceId from './getVolumeViewReferenceId';
 import calculateSpacingBetweenImageIds from './calculateSpacingBetweenImageIds';
 export * as logger from './logger';
 import { calculateNeighborhoodStats } from './calculateNeighborhoodStats';
+import {
+  mapScalarToViewportVoiIntensity,
+  mapViewportVoiIntensityToScalar,
+  mapMappedBandToRawRange,
+} from './viewportVoiIntensityMapping';
+export type { ViewportVoiMappingProps } from './viewportVoiIntensityMapping';
+export {
+  isRenderableVOILUT,
+  getVOILUTSequenceRange,
+  getVOILUTOutputScale,
+  sampleVOILUT,
+  createVOILUTSampler,
+  invertVOILUTSample,
+} from './createVOILUTSequenceTransferFunction';
+export type { RenderableVOILUT } from './createVOILUTSequenceTransferFunction';
+export {
+  normalizeVOILUTFunction,
+  getValidVOILUTFunction,
+} from './voiLUTFunction';
+export {
+  default as normalizeVOILUTSequence,
+  getVOILUTBytesPerEntry,
+} from './normalizeVOILUTSequence';
 export * from './getPixelSpacingInformation';
-import { asArray } from './asArray';
+export * from './getPlaneCubeIntersectionDimensions';
+export * from './rotateToViewCoordinates';
+export * as voxelSlab from './voxelSlab';
+import { asArray, asArrayFirst } from './asArray';
+import {
+  viewportSupportsImageSlices,
+  viewportSupportsStackCalibration,
+  viewportSupportsStackCompatibility,
+  viewportSupportsVolumeActors,
+  viewportSupportsVolumeCompatibility,
+  viewportSupportsVolumeId,
+  viewportSupportsVolumeURI,
+  isGenericViewport,
+  viewportSupportsDisplaySetPresentation,
+  getViewportContentMode,
+  viewportIsInVolumeMode,
+  viewportIsInStackMode,
+} from './viewportCapabilities';
+import { getNormalizedAspectRatio } from './getNormalizedAspectRatio';
+import {
+  getWasmBasePath,
+  resolveWasmBasePath,
+  setWasmBasePath,
+} from './wasmBasePath';
+import resolveApplicationUrl, { getPublicUrl } from './resolveApplicationUrl';
 export { updatePlaneRestriction } from './updatePlaneRestriction';
-
+export { isAcquisitionPlaneNormal } from './isAcquisitionPlaneNormal';
 const getViewportModality = (viewport: IViewport, volumeId?: string) =>
   _getViewportModality(viewport, volumeId, cache.getVolume);
+const getScalingDescriptor = (viewport: IViewport, targetId?: string) =>
+  _getScalingDescriptor(viewport, targetId, cache.getVolume);
 
 export * from './isEqual';
 
@@ -116,6 +192,7 @@ export {
   eventListener,
   csUtils as invertRgbTransferFunction,
   createSigmoidRGBTransferFunction,
+  createVOILUTSequenceTransferFunction,
   getVoiFromSigmoidRGBTransferFunction,
   createLinearRGBTransferFunction,
   scaleRgbTransferFunction,
@@ -126,16 +203,26 @@ export {
   clamp,
   uuidv4,
   getMinMax,
+  clonePoint3,
+  hasOwn,
   getRuntimeId,
+  getVOIRangeFromWindowLevel,
   isOpposite,
   getViewportModality,
+  getScalingDescriptor,
+  resolveGenericViewportVolumeId,
   windowLevel,
   convertToGrayscale,
+  convertColorArrayToRgbString,
   getClosestImageId,
   getSpacingInNormalDirection,
+  getEffectiveSpacingAlongDirection,
+  sampleVolumeGrid,
+  getViewSlabDepth,
   getTargetVolumeAndSpacingInNormalDir,
   getVolumeActorCorners,
   indexWithinDimensions,
+  indexAlmostWithinDimensions,
   getVolumeViewportsContainingSameVolumes,
   getViewportsWithVolumeId,
   transformWorldToIndex,
@@ -169,6 +256,7 @@ export {
   ProgressiveIterator,
   decimate,
   imageRetrieveMetadataProvider,
+  genericViewportDisplaySetMetadataProvider,
   transferFunctionUtils,
   updateVTKImageDataWithCornerstoneImage,
   sortImageIdsAndGetSpacing,
@@ -180,16 +268,19 @@ export {
   generateVolumePropsFromImageIds,
   getBufferConfiguration,
   VoxelManager,
+  CompositeVoxelManager,
   RLEVoxelMap,
   convertStackToVolumeViewport,
   convertVolumeToStackViewport,
   roundNumber,
+  roundNumberTrim,
   roundToPrecision,
   getViewportImageIds,
   getRandomSampleFromArray,
   getVolumeId,
   color,
   hasFloatScalingParameters,
+  getScalingMode,
   getDynamicVolumeInfo,
   autoLoad,
   scaleArray,
@@ -198,16 +289,44 @@ export {
   handleMultiframe4D,
   generateFrameImageId,
   pointInShapeCallback,
+  ECGUtilities,
+  VideoUtilities,
+  WSIUtilities,
+  voxelGrid,
   deepEqual,
   jumpToSlice,
   scroll,
   clip,
   transformWorldToIndexContinuous,
   createSubVolume,
+  getAcquisitionPlaneOrientation,
   getVolumeDirectionVectors,
+  getVolumeViewReferenceId,
   calculateSpacingBetweenImageIds,
   getImageDataMetadata,
   buildMetadata,
   calculateNeighborhoodStats,
+  mapScalarToViewportVoiIntensity,
+  mapViewportVoiIntensityToScalar,
+  mapMappedBandToRawRange,
   asArray,
+  asArrayFirst,
+  viewportSupportsImageSlices,
+  viewportSupportsStackCalibration,
+  viewportSupportsStackCompatibility,
+  viewportSupportsVolumeActors,
+  viewportSupportsVolumeCompatibility,
+  viewportSupportsVolumeId,
+  viewportSupportsVolumeURI,
+  isGenericViewport,
+  viewportSupportsDisplaySetPresentation,
+  getViewportContentMode,
+  viewportIsInVolumeMode,
+  viewportIsInStackMode,
+  getNormalizedAspectRatio,
+  getWasmBasePath,
+  setWasmBasePath,
+  resolveWasmBasePath,
+  resolveApplicationUrl,
+  getPublicUrl,
 };

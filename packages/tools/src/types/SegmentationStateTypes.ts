@@ -38,9 +38,25 @@ export type Segmentation = {
   segmentationId: string;
   /** segmentation label */
   label: string;
+  fallbackLabel?: string;
+  /**
+   * The creator invented the label, so no user has named this segmentation.
+   * A generated name must not become a default offered for a later one.
+   */
+  labelIsGenerated?: boolean;
+  /**
+   * The instance this segmentation was loaded from, or was last stored as.
+   * A save writes a new revision of it. See `Annotation.predecessorImageId`.
+   */
+  predecessorImageId?: string;
   segments: {
     [segmentIndex: number]: Segment;
   };
+  /**
+   * Explicit segment order for display and iteration. When omitted, the
+   * normalized insertion/numeric order is used.
+   */
+  segmentOrder?: number[];
   /**
    * Representations of the segmentation. Each segmentation "can" be viewed
    * in various representations. For instance, if a DICOM SEG is loaded, the main
@@ -62,6 +78,7 @@ export type LabelmapRenderingConfig = {
   colorLUTIndex: number;
   // segmentation blend mode if desired
   blendMode?: coreEnums.BlendModes;
+  useSliceRendering?: boolean;
 };
 
 export type ContourRenderingConfig = {};
@@ -126,7 +143,13 @@ export type SegmentationPublicInput = {
     segments?: {
       [segmentIndex: number]: Partial<Segment>;
     };
+    segmentOrder?: number[];
     label?: string;
+    fallbackLabel?: string;
+    /** See `Segmentation.labelIsGenerated`. */
+    labelIsGenerated?: boolean;
+    /** See `Segmentation.predecessorImageId`. */
+    predecessorImageId?: string;
     // segmentation level stats
     cachedStats?: { [key: string]: unknown };
   };
@@ -142,5 +165,6 @@ export type RepresentationPublicInput = {
   config?: {
     colorLUTOrIndex?: Types.ColorLUT | number;
     blendMode?: coreEnums.BlendModes;
+    useSliceRendering?: boolean;
   };
 };

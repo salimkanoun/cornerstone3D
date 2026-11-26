@@ -9,12 +9,18 @@ import {
 import { getActiveSegmentIndex } from '../../stateManagement/segmentation/getActiveSegmentIndex';
 import { getSegmentation } from '../../stateManagement/segmentation/getSegmentation';
 import { getStrategyData } from '../../tools/segmentation/strategies/utils/getStrategyData';
+import type { StrategyData } from '../../tools/segmentation/strategies/utils/getStrategyData';
 import ensureSegmentationVolume from '../../tools/segmentation/strategies/compositions/ensureSegmentationVolume';
 import ensureImageVolume from '../../tools/segmentation/strategies/compositions/ensureImageVolume';
 import type {
   LabelmapSegmentationDataStack,
   LabelmapSegmentationDataVolume,
 } from '../../types/LabelmapTypes';
+import { utilities as cornerstoneUtilities } from '@cornerstonejs/core';
+
+const cs3dLogger = cornerstoneUtilities.logger.toolsLog.getLogger(
+  'utilities.segmentation.utilsForWorker'
+);
 
 /**
  * Trigger worker progress event
@@ -39,12 +45,20 @@ export const getSegmentationDataForWorker = (
   segmentIndices
 ) => {
   const segmentation = getSegmentation(segmentationId);
+  if (!segmentation?.representationData) {
+    cs3dLogger.debug(
+      'getSegmentationDataForWorker: segmentation missing or not ready',
+      segmentationId
+    );
+    return null;
+  }
+
   const { representationData } = segmentation;
 
   const { Labelmap } = representationData;
 
   if (!Labelmap) {
-    console.debug('No labelmap found for segmentation', segmentationId);
+    cs3dLogger.debug('No labelmap found for segmentation', segmentationId);
     return null;
   }
 
@@ -58,8 +72,8 @@ export const getSegmentationDataForWorker = (
     imageIds: segImageIds,
   };
 
-  let reconstructableVolume = false;
-  if (segImageIds) {
+  let reconstructableVolume = Boolean(segVolumeId);
+  if (!reconstructableVolume && segImageIds) {
     const refImageIds = segImageIds.map((imageId) => {
       const image = cache.getImage(imageId);
       return image.referencedImageId;
@@ -90,7 +104,9 @@ export const getSegmentationDataForWorker = (
  * @param operationData - The operation data
  * @returns The strategy data
  */
-export const prepareVolumeStrategyDataForWorker = (operationData) => {
+export const prepareVolumeStrategyDataForWorker = (
+  operationData
+): StrategyData | null => {
   return getStrategyData({
     operationData,
     strategy: {

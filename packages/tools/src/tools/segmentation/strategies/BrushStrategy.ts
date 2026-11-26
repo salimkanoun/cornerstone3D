@@ -1,5 +1,4 @@
 import type { Types } from '@cornerstonejs/core';
-import { utilities as csUtils } from '@cornerstonejs/core';
 
 import { triggerSegmentationDataModified } from '../../../stateManagement/segmentation/triggerSegmentationEvents';
 import compositions from './compositions';
@@ -8,6 +7,14 @@ import { StrategyCallbacks } from '../../../enums';
 import type { LabelmapToolOperationDataAny } from '../../../types/LabelmapToolOperationData';
 import type vtkImageData from '@kitware/vtk.js/Common/DataModel/ImageData';
 import type { LabelmapMemo } from '../../../utilities/segmentation/createLabelmapMemo';
+import { memoAsStep } from '../../../utilities/segmentation/createLabelmapMemo';
+import {
+  eraseCrossLayerOverwrites,
+  prepareOverlapOperationData,
+} from './utils/labelmapOverlap';
+import type { LabelmapEditTransaction } from '../../../stateManagement/segmentation/helpers/labelmapSegmentationState';
+import { shouldUseLazyLabelmapEditing } from '../utils/shouldUseLazyLabelmapEditing';
+import type { BrushVoxelSlabFill } from './utils/brushVoxelSlab';
 
 export type InitializedOperationData = LabelmapToolOperationDataAny & {
   // Allow initialization that is operation specific by keying on the name
@@ -25,6 +32,12 @@ export type InitializedOperationData = LabelmapToolOperationDataAny & {
   centerWorld: Types.Point3;
   isInObject: (point: Types.Point3) => boolean;
   isInObjectBoundsIJK: Types.BoundsIJK;
+  /**
+   * When set, {@link compositions.regionFill} takes the voxels from the shared
+   * voxel slab iterator, which walks the brush shape itself, instead of the
+   * axis-aligned IJK bounding box around it.
+   */
+  brushVoxelSlabFill?: BrushVoxelSlabFill;
   viewport: Types.IViewport;
   imageVoxelManager:
     | Types.IVoxelManager<number>
@@ -60,9 +73,15 @@ export type InitializedOperationData = LabelmapToolOperationDataAny & {
     viewportIdsToRender: string[];
     centerCanvas?: Array<number>;
     viewport: Types.IViewport;
-  }
+  };
   memo?: LabelmapMemo;
   modified?: boolean;
+  previewOnHover?: boolean;
+  labelValue?: number;
+  labelmapId?: string;
+  overwriteSegmentIndices?: number[];
+  imageId?: string;
+  labelmapEditTransaction?: LabelmapEditTransaction;
 };
 
 export type StrategyFunction = (
@@ -183,18 +202,24 @@ export default class BrushStrategy {
     this.configurationName = name;
 
     // Ensuring backwards compatibility - always have a circular cursor if none is defined
-    const cursorGeometryInitializer = initializers.find(init => init.hasOwnProperty(StrategyCallbacks.CalculateCursorGeometry))
-    const renderCursorInitializer = initializers.find(init => init.hasOwnProperty(StrategyCallbacks.RenderCursor));
+    const cursorGeometryInitializer = initializers.find((init) =>
+      init.hasOwnProperty(StrategyCallbacks.CalculateCursorGeometry)
+    );
+    const renderCursorInitializer = initializers.find((init) =>
+      init.hasOwnProperty(StrategyCallbacks.RenderCursor)
+    );
 
-    if(!cursorGeometryInitializer) {
+    if (!cursorGeometryInitializer) {
       initializers.push({
-        [StrategyCallbacks.CalculateCursorGeometry]: compositions.circularCursor.calculateCursorGeometry
+        [StrategyCallbacks.CalculateCursorGeometry]:
+          compositions.circularCursor.calculateCursorGeometry,
       });
     }
 
-    if(!renderCursorInitializer) {
+    if (!renderCursorInitializer) {
       initializers.push({
-        [StrategyCallbacks.RenderCursor]: compositions.circularCursor.renderCursor
+        [StrategyCallbacks.RenderCursor]:
+          compositions.circularCursor.renderCursor,
       });
     }
 
@@ -240,13 +265,80 @@ export default class BrushStrategy {
       return;
     }
 
+    const isLazyLabelmapEditing = shouldUseLazyLabelmapEditing(
+      initializedData.viewport
+    );
+    const shouldPrepareOverlap =
+      !isLazyLabelmapEditing || !initializedData.previewOnHover;
+    const originalSegmentationVoxelManager =
+      initializedData.segmentationVoxelManager;
+    const originalSegmentationImageData = initializedData.segmentationImageData;
+
+    if (shouldPrepareOverlap) {
+      prepareOverlapOperationData(initializedData);
+    }
+
+    if (
+      initializedData.memo?.segmentationVoxelManager !==
+      initializedData.segmentationVoxelManager
+    ) {
+      // Mid-stroke voxel-manager swap (the segment moved to a private layer):
+      // commit the earlier same-stroke writes and ride them on the new memo so
+      // the whole stroke stays one undo/redo unit.
+      const previousMemo = initializedData.memo;
+      initializedData.memo = initializedData.createMemo(
+        initializedData.segmentationId,
+        initializedData.segmentationVoxelManager
+      );
+      if (
+        previousMemo &&
+        previousMemo !== initializedData.memo &&
+        previousMemo.commitMemo?.()
+      ) {
+        (initializedData.memo.priorSteps ||= []).push(memoAsStep(previousMemo));
+      }
+    }
+
+    // Record the segment move (layer registration + bulk voxel move + binding
+    // change) on the stroke's memo, so undo removes the private layer and
+    // returns the segment to its previous layer, and redo replays the move.
+    // The raw step doesn't fire events itself (keeps the labelmap model free
+    // of the event-layer import), so wrap it with the data-modified trigger.
+    const moveStep = initializedData.labelmapEditTransaction?.moveStep;
+    if (moveStep && initializedData.memo) {
+      const { segmentationId } = initializedData;
+      (initializedData.memo.priorSteps ||= []).push({
+        undo: () => {
+          moveStep.undo();
+          triggerSegmentationDataModified(segmentationId);
+        },
+        redo: () => {
+          moveStep.redo();
+          triggerSegmentationDataModified(segmentationId);
+        },
+      });
+    }
+
+    if (
+      initializedData.segmentationVoxelManager !==
+        originalSegmentationVoxelManager ||
+      initializedData.segmentationImageData !== originalSegmentationImageData
+    ) {
+      this._initialize.forEach((func) => func(initializedData));
+    }
+
     this._fill.forEach((func) => func(initializedData));
 
     const { segmentationVoxelManager, segmentIndex } = initializedData;
+    const crossLayerModifiedSlices = eraseCrossLayerOverwrites(initializedData);
+    const modifiedSlices = new Set<number>([
+      ...(segmentationVoxelManager.getArrayOfModifiedSlices() ?? []),
+      ...crossLayerModifiedSlices,
+    ]);
 
     triggerSegmentationDataModified(
       initializedData.segmentationId,
-      segmentationVoxelManager.getArrayOfModifiedSlices(),
+      Array.from(modifiedSlices),
       segmentIndex
     );
 
@@ -263,7 +355,12 @@ export default class BrushStrategy {
 
     const data = getStrategyData({ operationData, viewport, strategy: this });
 
-    if (!data) {
+    if (
+      !data ||
+      !data.imageVoxelManager ||
+      !data.segmentationVoxelManager ||
+      !data.segmentationImageData
+    ) {
       return null;
     }
 
@@ -411,7 +508,6 @@ export default class BrushStrategy {
     enabledElement: Types.IEnabledElement,
     operationData: InitializedOperationData
   ) => void;
-
 }
 /**
  * Adds a list method to the set of defined methods.

@@ -24,13 +24,11 @@ import {
 import {
   drawLine as drawLineSvg,
   drawHandles as drawHandlesSvg,
-  drawLinkedTextBox as drawLinkedTextBoxSvg,
 } from '../../drawingSvg';
 import { state } from '../../store/state';
 import { ChangeTypes, Events, MeasurementType } from '../../enums';
 import { getViewportIdsWithToolToRender } from '../../utilities/viewportFilters';
 import * as lineSegment from '../../utilities/math/line';
-import { getTextBoxCoordsCanvas } from '../../utilities/drawing';
 import {
   resetElementCursor,
   hideElementCursor,
@@ -49,8 +47,11 @@ import type { BidirectionalAnnotation } from '../../types/ToolSpecificAnnotation
 import triggerAnnotationRenderForViewportIds from '../../utilities/triggerAnnotationRenderForViewportIds';
 import type { StyleSpecifier } from '../../types/AnnotationStyle';
 import { getStyleProperty } from '../../stateManagement/annotation/config/helpers';
+import { utilities as cornerstoneUtilities } from '@cornerstonejs/core';
 
-const { transformWorldToIndex } = csUtils;
+const cs3dLogger = cornerstoneUtilities.logger.toolsLog.getLogger(
+  'tools.annotation.BidirectionalTool'
+);
 
 /**
  * BidirectionalTool let you draw annotations that measures the length and
@@ -210,7 +211,7 @@ class BidirectionalTool extends AnnotationTool {
     // Exclude toolInstance from the options passed into the metadata
     const { toolInstance, ...serializableOptions } = options || {};
 
-    const annotation = {
+    const annotation: BidirectionalAnnotation = {
       annotationUID: options?.annotationUID || utilities.uuidv4(),
       data: {
         handles: {
@@ -246,7 +247,7 @@ class BidirectionalTool extends AnnotationTool {
     addAnnotation(annotation, viewport.element);
     triggerAnnotationRenderForViewportIds([viewport.id]);
 
-    return annotation as BidirectionalAnnotation;
+    return annotation;
   };
 
   /**
@@ -1083,7 +1084,7 @@ class BidirectionalTool extends AnnotationTool {
     };
 
     for (let i = 0; i < annotations.length; i++) {
-      const annotation = annotations[i] as BidirectionalAnnotation;
+      const annotation = annotations[i];
       const { annotationUID, data } = annotation;
       const { points, activeHandleIndex } = data.handles;
       const canvasCoordinates = points.map((p) => viewport.worldToCanvas(p));
@@ -1118,7 +1119,7 @@ class BidirectionalTool extends AnnotationTool {
 
       // If rendering engine has been destroyed while rendering
       if (!viewport.getRenderingEngine()) {
-        console.warn('Rendering Engine has been destroyed');
+        cs3dLogger.warn('Rendering Engine has been destroyed');
         return renderStatus;
       }
 
@@ -1191,59 +1192,22 @@ class BidirectionalTool extends AnnotationTool {
 
       renderStatus = true;
 
-      const options = this.getLinkedTextBoxStyle(styleSpecifier, annotation);
-      if (!options.visibility) {
-        data.handles.textBox = {
-          hasMoved: false,
-          worldPosition: <Types.Point3>[0, 0, 0],
-          worldBoundingBox: {
-            topLeft: <Types.Point3>[0, 0, 0],
-            topRight: <Types.Point3>[0, 0, 0],
-            bottomLeft: <Types.Point3>[0, 0, 0],
-            bottomRight: <Types.Point3>[0, 0, 0],
-          },
-        };
-        continue;
-      }
-
       const textLines = this.configuration.getTextLines(data, targetId);
       if (!textLines || textLines.length === 0) {
         continue;
       }
-
-      let canvasTextBoxCoords;
-
-      if (!data.handles.textBox.hasMoved) {
-        canvasTextBoxCoords = getTextBoxCoordsCanvas(canvasCoordinates);
-
-        data.handles.textBox.worldPosition =
-          viewport.canvasToWorld(canvasTextBoxCoords);
+      if (
+        !this.renderLinkedTextBoxAnnotation({
+          enabledElement,
+          svgDrawingHelper,
+          annotation,
+          styleSpecifier,
+          textLines,
+          canvasCoordinates,
+        })
+      ) {
+        continue;
       }
-
-      const textBoxPosition = viewport.worldToCanvas(
-        data.handles.textBox.worldPosition
-      );
-
-      const textBoxUID = '1';
-      const boundingBox = drawLinkedTextBoxSvg(
-        svgDrawingHelper,
-        annotationUID,
-        textBoxUID,
-        textLines,
-        textBoxPosition,
-        canvasCoordinates,
-        {},
-        options
-      );
-
-      const { x: left, y: top, width, height } = boundingBox;
-
-      data.handles.textBox.worldBoundingBox = {
-        topLeft: viewport.canvasToWorld([left, top]),
-        topRight: viewport.canvasToWorld([left + width, top]),
-        bottomLeft: viewport.canvasToWorld([left, top + height]),
-        bottomRight: viewport.canvasToWorld([left + width, top + height]),
-      };
     }
 
     return renderStatus;

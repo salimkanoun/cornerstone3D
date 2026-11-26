@@ -1,0 +1,177 @@
+import VOILUTFunctionType from '../enums/VOILUTFunctionType';
+import type { CPUFallbackLUT, VOIRange } from '../types';
+import type { RenderableVOILUT } from './createVOILUTSequenceTransferFunction';
+import {
+  createVOILUTSampler,
+  invertVOILUTBand,
+  invertVOILUTSample,
+  isRenderableVOILUT,
+} from './createVOILUTSequenceTransferFunction';
+import { logit } from './logit';
+import * as windowLevelUtil from './windowLevel';
+
+const Y_EPS = 1e-6;
+
+/**
+ * The sampler of the last VOI LUT Sequence that was asked for.
+ *
+ * createVOILUTSampler reads every entry of the LUT to get the scale of the
+ * entries, and a LUT holds up to 65536 entries. The callers map one voxel for
+ * each call over a whole region (refer to runFloodFillSegmentation and to
+ * adaptiveRegionIntensityRange), always with the same LUT and the same range.
+ * Thus one entry is enough to remove the scan from the loop.
+ */
+let lastSampler: {
+  voiLUT: RenderableVOILUT;
+  lower: number;
+  upper: number;
+  sample: (value: number) => number;
+} | null = null;
+
+function getVOILUTSampler(
+  voiLUT: RenderableVOILUT,
+  voiRange: VOIRange
+): (value: number) => number {
+  const { lower, upper } = voiRange;
+
+  if (
+    lastSampler &&
+    lastSampler.voiLUT === voiLUT &&
+    lastSampler.lower === lower &&
+    lastSampler.upper === upper
+  ) {
+    return lastSampler.sample;
+  }
+
+  const sample = createVOILUTSampler(voiLUT, voiRange);
+
+  lastSampler = { voiLUT, lower, upper, sample };
+
+  return sample;
+}
+
+export type ViewportVoiMappingProps = {
+  voiRange: { lower: number; upper: number };
+  VOILUTFunction?: string | VOILUTFunctionType;
+  /**
+   * VOI LUT Sequence (0028,3010) of the image, when it controls the display.
+   * The sequence is the whole VOI transformation, so it replaces the window and
+   * the VOI LUT Function (PS3.3 C.11.2.1). Without it a tool that works in
+   * display intensity sees a linear ramp, and the viewport shows the curve.
+   */
+  voiLUT?: CPUFallbackLUT;
+  /**
+   * When true the viewport renders the VOI inverted (e.g. PET AC), so the
+   * displayed intensity is `1 − mapped`. Both the forward and inverse maps must
+   * honor this or sampled display luma will inverse-map to the wrong raw end.
+   */
+  invert?: boolean;
+};
+
+/**
+ * Maps a stored scalar to a normalized display intensity in [0, 1] using the same
+ * convention as VTK RGB transfer functions (linear) or DICOM sigmoid (sampled).
+ */
+export function mapScalarToViewportVoiIntensity(
+  value: number,
+  props: ViewportVoiMappingProps
+): number {
+  const { lower, upper } = props.voiRange;
+  const span = upper - lower;
+  const fn = props.VOILUTFunction as string | undefined;
+  const applyInvert = (y: number) => (props.invert === true ? 1 - y : y);
+
+  if (isRenderableVOILUT(props.voiLUT)) {
+    return applyInvert(getVOILUTSampler(props.voiLUT, props.voiRange)(value));
+  }
+
+  if (fn === VOILUTFunctionType.SAMPLED_SIGMOID || fn === 'SIGMOID') {
+    const { windowCenter, windowWidth } = windowLevelUtil.toWindowLevel(
+      lower,
+      upper
+    );
+    const w = Math.max(Math.abs(windowWidth), 1e-12);
+    return applyInvert(1 / (1 + Math.exp((-4 * (value - windowCenter)) / w)));
+  }
+
+  if (span === 0 || !Number.isFinite(span)) {
+    return applyInvert(0);
+  }
+  return applyInvert(clamp01((value - lower) / span));
+}
+
+/**
+ * Inverse map: normalized intensity Y in (0, 1) back to stored scalar.
+ * Endpoints Y=0 and Y=1 map to lower and upper for linear modes.
+ */
+export function mapViewportVoiIntensityToScalar(
+  mapped01: number,
+  props: ViewportVoiMappingProps
+): number {
+  const { lower, upper } = props.voiRange;
+  const fn = props.VOILUTFunction as string | undefined;
+  // Undo display inversion before mapping back to a stored scalar so the
+  // round-trip with mapScalarToViewportVoiIntensity is exact.
+  const y =
+    props.invert === true ? clamp01(1 - clamp01(mapped01)) : clamp01(mapped01);
+
+  if (isRenderableVOILUT(props.voiLUT)) {
+    return invertVOILUTSample(props.voiLUT, y, props.voiRange);
+  }
+
+  if (fn === VOILUTFunctionType.SAMPLED_SIGMOID || fn === 'SIGMOID') {
+    const { windowCenter, windowWidth } = windowLevelUtil.toWindowLevel(
+      lower,
+      upper
+    );
+    const yy = clamp(y, Y_EPS, 1 - Y_EPS);
+    return logit(yy, windowCenter, windowWidth);
+  }
+
+  const span = upper - lower;
+  if (span === 0 || !Number.isFinite(span)) {
+    return lower;
+  }
+  return lower + y * span;
+}
+
+/**
+ * Converts a tolerance band in mapped [0,1] space to raw [rawMin, rawMax] (ordered).
+ */
+export function mapMappedBandToRawRange(
+  mappedMin: number,
+  mappedMax: number,
+  props: ViewportVoiMappingProps
+): { rawMin: number; rawMax: number } {
+  const a = Math.min(mappedMin, mappedMax);
+  const b = Math.max(mappedMin, mappedMax);
+
+  if (isRenderableVOILUT(props.voiLUT)) {
+    const band =
+      props.invert === true
+        ? invertVOILUTBand(props.voiLUT, 1 - b, 1 - a, props.voiRange)
+        : invertVOILUTBand(props.voiLUT, a, b, props.voiRange);
+
+    if (band) {
+      return { rawMin: band.lower, rawMax: band.upper };
+    }
+  }
+
+  const rawAtA = mapViewportVoiIntensityToScalar(a, props);
+  const rawAtB = mapViewportVoiIntensityToScalar(b, props);
+  return {
+    rawMin: Math.min(rawAtA, rawAtB),
+    rawMax: Math.max(rawAtA, rawAtB),
+  };
+}
+
+function clamp01(x: number): number {
+  if (!Number.isFinite(x)) {
+    return 0;
+  }
+  return clamp(x, 0, 1);
+}
+
+function clamp(x: number, lo: number, hi: number): number {
+  return Math.min(hi, Math.max(lo, x));
+}

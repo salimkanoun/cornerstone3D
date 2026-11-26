@@ -57,6 +57,14 @@
         "name": "Stack Viewport Canvas-to-World",
         "description": "Demonstrates how to obtain the coordinates in the 3D world from a coordinate on the canvas."
       },
+      "displaySets": {
+        "name": "Display Sets",
+        "description": "Splits each series into display sets with the default split rules of @cornerstonejs/metadata, and shows one viewport for each display set."
+      },
+      "displaySetRules": {
+        "name": "Display Set Rules",
+        "description": "Edits the display set split rules as data: turn a rule off, apply an optional rule file, or paste, open or fetch a JSON rule set, and see the series split again."
+      },
       "volumeBasic": {
         "name": "Basic Volume Viewport Usage",
         "description": "Displays a set of DICOM images in a Volume Viewport."
@@ -129,6 +137,10 @@
         "name": "DICOM P10 from the local file system",
         "description": "Provides an interface to load a DICOM P10 image from your local file system to the Cornerstone3D"
       },
+      "voiLutFunction": {
+        "name": "VOI LUT Function and VOI LUT Sequence",
+        "description": "Loads a local DICOM P10 file and shows how its VOI is applied: LINEAR / LINEAR_EXACT / SIGMOID VOI LUT Function (0028,1056), and the VOI LUT Sequence (0028,3010) compared against a plain window, on both the GPU and CPU paths"
+      },
       "advancedLocal": {
         "name": "DICOM P10 with annotation and CPU choice",
         "description": "Annotation tools with drag and drop and CPU/GPU choice"
@@ -148,6 +160,10 @@
       "viewReferencePresentation": {
         "name": "Apply view reference and/or presentation parameters",
         "description": "Demonstrates how to apply various view/reference presentation parameters."
+      },
+      "viewportProjection": {
+        "name": "Viewport Projection Service",
+        "description": "Demonstrates projection snapshots and presentation writes for Planar Next and Volume 3D Next viewports."
       },
       "stackToVolume": {
         "name": "Stack to Volume Viewport",
@@ -176,12 +192,20 @@
       "smoothing": {
         "name": "Image Smoothing For Stack & Volume Viewports",
         "description": "Demonstrates how to apply image smoothing to stack and volume viewports"
+      },
+      "axisBasedImageStretching": {
+        "name": "Axis-based Image Stretching",
+        "description": "Here we demonstrate axis based stretching with annotation and segmentation tools"
       }
     },
     "tools-basic": {
       "etdrsGrid": {
         "name": "ETDRS Grid Tool",
         "description": "Demonstrates how to use the ETDRS Grid tool. An ETDRS Grid (Early Treatment Diabetic Retinopathy Study Grid) is a standardized grid used in ophthalmology to assess macular thickness and retinal changes."
+      },
+      "imageCPRMapper": {
+        "name": "Image CPR Mapper",
+        "description": "Demonstrates how to take a SplineROI annotation line from a Sagittal viewport and project the volume data along that centerline into a Stack viewport."
       },
       "cursor3D": {
         "name": "3D Volume Picking",
@@ -195,9 +219,17 @@
         "name": "Multiple Tool Groups",
         "description": "Demonstrates the usage of multiple tool groups for a set of viewports."
       },
+      "leftClickRightClickTools": {
+        "name": "Left Click and Right Click multi bindings",
+        "description": "Demonstrates how to bind different annotation tools to left and right mouse buttons. Left click uses the Length tool, and right click uses the Bidirectional tool.  Center/wheel+shift pan/zoom, and shift/left or right click to draw a rectangle or circle."
+      },
       "stackManipulationTools": {
         "name": "Stack Manipulation Tools",
         "description": "Demonstrates several manipulation tools (window/level, pan, zoom) as well as Stack Viewport-specific scrolling"
+      },
+      "viewportProjectionSynchronizer": {
+        "name": "Viewport Projection Synchronizer",
+        "description": "Demonstrates a custom tool-driven synchronizer for Planar Next viewports using the projection service."
       },
       "stackManipulationToolsTouch": {
         "name": "Stack Manipulation Tools Touch",
@@ -337,15 +369,31 @@
         "name": "Whole Slide Imaging",
         "description": "Display WSI Series"
       },
+      "ecg": {
+        "name": "ECG Viewport",
+        "description": "Displays a 12-lead ECG from DICOM Waveform data."
+      },
       "wsiAnnotationTools": {
         "name": "WSI Annotation Tools",
         "description": "WSI with length and other annotation tools"
       }
     },
     "tools-segmentation": {
+      "clickSegment": {
+        "name": "Click Segment Tool",
+        "description": "Click-to-segment lesions on PET: hover to scout candidates (plus/blocked cursor), click once to segment with a dynamically-derived one-sided threshold, then Shrink/Expand to fine-tune. No configuration."
+      },
       "labelmapRendering": {
         "name": "Labelmap Segmentation Rendering",
         "description": "Demonstrates how to add a Labelmap to the viewports for rendering"
+      },
+      "labelmapSliceRendering": {
+        "name": "Labelmap Slice Rendering (useSliceRendering)",
+        "description": "Demonstrates labelmap rendering with useSliceRendering to avoid 3D texture allocation"
+      },
+      "labelmapSliceRenderingTools": {
+        "name": "Labelmap Slice Rendering Tools (useSliceRendering)",
+        "description": "Demonstrates sphere brush painting with useSliceRendering enabled"
       },
       "contourRendering": {
         "name": "Contour Segmentation Representation",
@@ -378,6 +426,14 @@
       "labelmapSegmentationTools": {
         "name": "Segmentation Tools (Labelmap) - Brush, Scissors",
         "description": "Demonstrates how to use manual segmentation tools to modify the segmentation data"
+      },
+      "labelmapOverlapPlayground": {
+        "name": "Labelmap Overlap Playground",
+        "description": "Minimal overlap demo with brush and eraser variants, segment selection, and an Allow Overlap toggle for legacy, cpu=true, and type=next."
+      },
+      "labelmapOverlapPetCt": {
+        "name": "Labelmap Overlap PET-CT",
+        "description": "Segmentation drawn on CT (top row) is also displayed on PET (bottom row). Demonstrates cross-volume labelmap rendering."
       },
       "labelmapStatistics": {
         "name": "Labelmap Statistics",
@@ -515,6 +571,34 @@
         "name": "Crosshairs",
         "description": "Here we demonstrate crosshairs linking three orthogonal views of the same data"
       },
+      "crossHairsBindings": {
+        "name": "Crosshairs Binding Modes",
+        "description": "Demonstrates Crosshairs as a regular active tool binding on either primary or right click."
+      },
+      "worldCrosshair": {
+        "name": "World Crosshair (Reference Point)",
+        "description": "Demonstrates the WorldCrosshairTool: a persistent world-space reference point that stays fixed while viewports scroll, pan and zoom, with off-slice projection display."
+      },
+      "worldCrosshairMip": {
+        "name": "World Crosshair on MIP",
+        "description": "Demonstrates the WorldCrosshairTool on a PET maximum intensity projection viewport: clicking the MIP snaps the reference point to the hottest voxel along the line of sight and the CT viewports jump to that anatomy."
+      },
+      "worldCrosshairSliceIntersectionsPetCt": {
+        "name": "World Crosshair + Slice Intersections (PET/CT, Generic Viewports)",
+        "description": "CT and PT rows of native PLANAR_NEXT viewports (2D planar stack plus axial/sagittal/coronal volume slices and a 3D bone rendering); one intersection line per plane group drives CT and PT together, with both tools independently toggleable."
+      },
+      "sliceIntersections": {
+        "name": "Slice Intersections",
+        "description": "Demonstrates the SliceIntersectionTool rendering one true plane-plane intersection line per plane, with line drag, rotation and slab thickness handles."
+      },
+      "worldCrosshairAndSliceIntersections": {
+        "name": "World Crosshair + Slice Intersections",
+        "description": "Demonstrates the WorldCrosshairTool and SliceIntersectionTool enabled together while remaining fully independent."
+      },
+      "tenViewportReferencePoint": {
+        "name": "Ten Viewport Reference Point",
+        "description": "Demonstrates the WorldCrosshairTool reference point on a large ten viewport grid."
+      },
       "mprReformat": {
         "name": "DICOM Reformats in MPR",
         "description": "Aligns MPR viewports to dicom acquisition orientations"
@@ -636,7 +720,6 @@
         "description": "Volume Decimated loading"
       }
     },
-  
     "adapters": {
       "segmentationStack": {
         "name": "DICOM SEG Stack",

@@ -1,5 +1,6 @@
 import type IBaseStreamingImageVolume from './IBaseStreamingImageVolume';
 import type Cornerstone3DConfig from './Cornerstone3DConfig';
+import type { LossyDownsampling } from './Cornerstone3DConfig';
 import type ICamera from './ICamera';
 import type IEnabledElement from './IEnabledElement';
 import type ICache from './ICache';
@@ -24,14 +25,19 @@ import type {
   ViewPresentation,
   ViewPresentationSelector,
   ViewportInput,
+  RenderingEngineResizeOptions,
 } from './IViewport';
+import type IGenericViewport from './IGenericViewport';
+import type { ViewportContentMode } from './IGenericViewport';
 import type {
   VolumeActor,
   Actor,
   ActorEntry,
+  ActorMapperProxy,
   ImageActor,
   ICanvasActor,
 } from './IActor';
+import { ActorRenderMode } from './IActor';
 import type {
   IImageLoadObject,
   IVolumeLoadObject,
@@ -59,6 +65,7 @@ import type {
   Scaling,
   ScalingParameters,
 } from './ScalingParameters';
+import type { ScalingDescriptor } from './ScalingDescriptor';
 import type StackViewportProperties from './StackViewportProperties';
 import type VolumeViewportProperties from './VolumeViewportProperties';
 import type IViewportId from './IViewportId';
@@ -119,10 +126,18 @@ import type { Color, ColorLUT } from './Color';
 import type VideoViewportProperties from './VideoViewportProperties';
 import type WSIViewportProperties from './WSIViewportProperties';
 import type { IVideoViewport } from './IVideoViewport';
+import type { IECGViewport } from './IECGViewport';
 import type {
   InternalVideoCamera,
   VideoViewportInput,
 } from './VideoViewportTypes';
+import type {
+  InternalECGCamera,
+  ECGViewportInput,
+  ECGChannel,
+  ECGWaveformData,
+} from './ECGViewportTypes';
+import type ECGViewportProperties from './ECGViewportProperties';
 import type { ISurface } from './ISurface';
 import type BoundsIJK from './BoundsIJK';
 import type { ImageVolumeProps } from './ImageVolumeProps';
@@ -135,7 +150,24 @@ import type {
   PolyDataPointConfiguration,
 } from './IPointsManager';
 import type IImageFrame from './IImageFrame';
-import type { IVoxelManager } from './IVoxelManager';
+import type {
+  IVolumeVoxelManager,
+  IVoxelManager,
+  VoxelManagerForEachCallbackArguments,
+  VoxelManagerForEachOptions,
+} from './IVoxelManager';
+import type {
+  VoxelGrid,
+  VoxelGridLimits,
+  VoxelGridReduction,
+  VoxelRepresentationId,
+} from './VoxelGrid';
+import type {
+  VoxelStatisticAccumulator,
+  VoxelStatisticDefinition,
+  VoxelStatisticSliceReducer,
+  VoxelStatisticPlaneFill,
+} from './VoxelStatistic';
 import type { IRLEVoxelMap, RLERun } from './IRLEVoxelMap';
 import type ImageLoadRequests from './ImageLoadRequests';
 import type { IBaseVolumeViewport } from './IBaseVolumeViewport';
@@ -145,7 +177,50 @@ import type JumpToSliceOptions from './JumpToSliceOptions';
 import type GeometryLoaderFn from './GeometryLoaderFn';
 
 import type { RenderingEngineModeType } from './RenderingEngineMode';
-import type { VtkOffscreenMultiRenderWindow } from './VtkOffscreenMultiRenderWindow';
+import type {
+  OffscreenCanvasContainer,
+  VtkOffscreenMultiRenderWindow,
+} from './VtkOffscreenMultiRenderWindow';
+import type { ViewportDataReference } from '../RenderingEngine/GenericViewport';
+import type { ResetCameraOptions, SetAspectRatioOptions } from './ICamera';
+import type {
+  ViewportType,
+  ViewportTypeConstants,
+  ViewportTypeRegistry,
+} from './ViewportTypeRegistry';
+import type {
+  EffectiveRenderBackend,
+  RenderBackendConstants,
+  RenderBackendRegistry,
+} from './RenderBackendRegistry';
+import type {
+  VoxelStatistic,
+  VoxelStatisticConstants,
+  VoxelStatisticRegistry,
+} from './VoxelStatisticRegistry';
+import type {
+  VoxelDataSource,
+  VoxelDataSourceConstants,
+  VoxelDataSourceRegistry,
+  VoxelReduction,
+  VoxelReductionConstants,
+  VoxelReductionRegistry,
+} from './VoxelQualityRegistry';
+import type {
+  DeliveredRegion,
+  VoxelQualityCause,
+  VoxelQualityRecord,
+  VoxelQualityRequirement,
+  VoxelQualityVerdict,
+  VoxelReductionDefinition,
+} from './VoxelQuality';
+import type {
+  IViewportFidelity,
+  ViewportFidelityCause,
+  ViewportFidelityState,
+  ViewportFidelityShownState,
+  FidelityIssue,
+} from './ViewportFidelity';
 
 export type * from './MetadataModuleTypes';
 export type * from './InstanceTypes';
@@ -153,11 +228,15 @@ export type * from './InstanceTypes';
 export type {
   // config
   Cornerstone3DConfig,
+  LossyDownsampling,
   //
   IBaseStreamingImageVolume,
   ICamera,
+  ResetCameraOptions,
+  SetAspectRatioOptions,
   IStackViewport,
   IVideoViewport,
+  IECGViewport,
   IWSIViewport,
   IVolumeViewport,
   IEnabledElement,
@@ -169,6 +248,7 @@ export type {
   IDynamicImageVolume,
   IRenderingEngine,
   ScalingParameters,
+  ScalingDescriptor,
   PTScaling,
   IPointsManager,
   PolyDataPointConfiguration,
@@ -185,12 +265,15 @@ export type {
   IRegisterImageLoader,
   IStreamingVolumeProperties,
   IViewport,
+  IGenericViewport,
+  ViewportContentMode,
   ViewReference,
   DataSetOptions as ImageSetOptions,
   ViewPresentation,
   ViewPresentationSelector,
   ReferenceCompatibleOptions,
   ViewReferenceSpecifier,
+  RenderingEngineResizeOptions,
   StackViewportProperties,
   VolumeViewportProperties,
   ViewportProperties,
@@ -198,6 +281,7 @@ export type {
   VolumeActor,
   Actor,
   ActorEntry,
+  ActorMapperProxy,
   ImageActor,
   ICanvasActor,
   IImageLoadObject,
@@ -275,6 +359,12 @@ export type {
   // video
   InternalVideoCamera,
   VideoViewportInput,
+  // ecg
+  InternalECGCamera,
+  ECGViewportInput,
+  ECGChannel,
+  ECGWaveformData,
+  ECGViewportProperties,
   BoundsIJK,
   BoundsLPS,
   Color,
@@ -283,6 +373,18 @@ export type {
   IImageFrame,
   LocalVolumeOptions,
   IVoxelManager,
+  IVolumeVoxelManager,
+  VoxelManagerForEachCallbackArguments,
+  VoxelManagerForEachOptions,
+  VoxelGrid,
+  VoxelGridLimits,
+  VoxelGridReduction,
+  VoxelRepresentationId,
+  VoxelStatistic,
+  VoxelStatisticAccumulator,
+  VoxelStatisticDefinition,
+  VoxelStatisticSliceReducer,
+  VoxelStatisticPlaneFill,
   IRLEVoxelMap,
   RLERun,
   ViewportInput,
@@ -297,4 +399,33 @@ export type {
   RLEVoxelMap,
   RenderingEngineModeType,
   VtkOffscreenMultiRenderWindow,
+  OffscreenCanvasContainer,
+  ViewportDataReference,
+  ViewportType,
+  ViewportTypeRegistry,
+  ViewportTypeConstants,
+  EffectiveRenderBackend,
+  RenderBackendRegistry,
+  RenderBackendConstants,
+  VoxelStatisticRegistry,
+  VoxelStatisticConstants,
+  VoxelReduction,
+  VoxelReductionRegistry,
+  VoxelReductionConstants,
+  VoxelReductionDefinition,
+  VoxelDataSource,
+  VoxelDataSourceRegistry,
+  VoxelDataSourceConstants,
+  DeliveredRegion,
+  VoxelQualityRecord,
+  VoxelQualityRequirement,
+  VoxelQualityVerdict,
+  VoxelQualityCause,
+  IViewportFidelity,
+  ViewportFidelityCause,
+  ViewportFidelityState,
+  ViewportFidelityShownState,
+  FidelityIssue,
 };
+
+export { ActorRenderMode };

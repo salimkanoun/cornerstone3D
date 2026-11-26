@@ -1,7 +1,6 @@
 import type { Types } from '@cornerstonejs/core';
 import {
   StackViewport,
-  cache,
   getEnabledElement,
   utilities as csUtils,
   utilities as coreUtils,
@@ -17,11 +16,9 @@ import { isAnnotationLocked } from '../../stateManagement/annotation/annotationL
 import {
   drawCircle as drawCircleSvg,
   drawHandles as drawHandlesSvg,
-  drawLinkedTextBox as drawLinkedTextBoxSvg,
 } from '../../drawingSvg';
 import { getViewportIdsWithToolToRender } from '../../utilities/viewportFilters';
 import getWorldWidthAndHeightFromTwoPoints from '../../utilities/planar/getWorldWidthAndHeightFromTwoPoints';
-import { getTextBoxCoordsCanvas } from '../../utilities/drawing';
 import throttle from '../../utilities/throttle';
 import debounce from '../../utilities/debounce';
 import { isAnnotationVisible } from '../../stateManagement/annotation/annotationVisibility';
@@ -40,7 +37,6 @@ import type {
   EventTypes,
   SVGDrawingHelper,
   Annotation,
-  AnnotationMetadata,
 } from '../../types';
 import type {
   CircleROIStartEndThresholdAnnotation,
@@ -62,6 +58,11 @@ import { BasicStatsCalculator } from '../../utilities/math/basic';
 
 import { filterAnnotationsWithinSamePlane } from '../../utilities/planar';
 import { getPixelValueUnits } from '../../utilities/getPixelValueUnits';
+import { utilities as cornerstoneUtilities } from '@cornerstonejs/core';
+
+const cs3dLogger = cornerstoneUtilities.logger.toolsLog.getLogger(
+  'tools.segmentation.CircleROIStartEndThresholdTool'
+);
 
 const { transformWorldToIndex } = csUtils;
 
@@ -118,36 +119,45 @@ class CircleROIStartEndThresholdTool extends CircleROITool {
    * a CircleROI Annotation and stores it in the annotationManager
    *
    * @param evt -  EventTypes.NormalizedMouseEventType
-   * @returns The annotation object.
+   * @returns The annotation object, or `null` when there is nothing to
+   *   measure on this viewport because a configured `targetsFilter` selects
+   *   no target on it (eg a PT only filter on a CT viewport).
    *
    */
-  addNewAnnotation = (evt: EventTypes.InteractionEventType) => {
+  addNewAnnotation = (
+    evt: EventTypes.InteractionEventType
+  ): Annotation | null => {
     const eventDetail = evt.detail;
     const { currentPoints, element } = eventDetail;
     const worldPos = currentPoints.world;
 
     const enabledElement = getEnabledElement(element);
-    const { viewport, renderingEngine } = enabledElement;
-
-    this.isDrawing = true;
+    const { viewport } = enabledElement;
 
     const camera = viewport.getCamera();
     const { viewPlaneNormal, viewUp } = camera;
 
-    let referencedImageId, imageVolume, volumeId;
     if (viewport instanceof StackViewport) {
       throw new Error('Stack Viewport Not implemented');
-    } else {
-      const targetId = this.getTargetId(viewport);
-      volumeId = csUtils.getVolumeId(targetId);
-      imageVolume = cache.getVolume(volumeId);
-
-      referencedImageId = csUtils.getClosestImageId(
-        imageVolume,
-        worldPos,
-        viewPlaneNormal
-      );
     }
+
+    // Resolve the target before any drawing state is set, so that a viewport
+    // with nothing to measure leaves the tool untouched rather than stuck
+    // mid-draw with no editData for cancel() to unwind.
+    const target = this.getTargetVolume(viewport);
+    if (!target) {
+      return null;
+    }
+
+    const volumeId = csUtils.getVolumeId(target.targetId);
+    const imageVolume = target.imageVolume;
+    const referencedImageId = csUtils.getClosestImageId(
+      imageVolume,
+      worldPos,
+      viewPlaneNormal
+    );
+
+    this.isDrawing = true;
 
     const spacingInNormal = csUtils.getSpacingInNormalDirection(
       imageVolume,
@@ -191,7 +201,7 @@ class CircleROIStartEndThresholdTool extends CircleROITool {
       ];
     }
 
-    const annotation = {
+    const annotation: CircleROIStartEndThresholdAnnotation = {
       highlighted: true,
       invalidated: true,
       metadata: {
@@ -226,9 +236,8 @@ class CircleROIStartEndThresholdTool extends CircleROITool {
         cachedStats: {
           pointsInVolume: [],
           projectionPoints: [],
-          statistics: [] as unknown as ROICachedStats,
+          statistics: [],
         },
-        labelmapUID: null,
       },
     };
 
@@ -298,15 +307,16 @@ class CircleROIStartEndThresholdTool extends CircleROITool {
       removeAnnotation(annotation.annotationUID);
     }
 
-    const targetId = this.getTargetId(enabledElement.viewport);
-    const imageVolume = cache.getVolume(targetId.split(/volumeId:|\?/)[1]);
+    const target = this.getTargetVolume(enabledElement.viewport);
 
-    this._computePointsInsideVolume(
-      annotation,
-      imageVolume,
-      targetId,
-      enabledElement
-    );
+    if (target) {
+      this._computePointsInsideVolume(
+        annotation,
+        target.imageVolume,
+        target.targetId,
+        enabledElement
+      );
+    }
 
     triggerAnnotationRenderForViewportIds(viewportIdsToRender);
 
@@ -438,25 +448,22 @@ class CircleROIStartEndThresholdTool extends CircleROITool {
       ] = middleCoordinate;
 
       // WE HAVE TO CACHE STATS BEFORE FETCHING TEXT
-      const iteratorVolumeIDs =
-        // @ts-ignore
-        annotationEnabledElement.viewport?.volumeIds.values();
+      const annotationViewport =
+        annotationEnabledElement?.viewport as Types.IVolumeViewport;
 
-      for (const volumeId of iteratorVolumeIDs) {
-        if (
-          annotation.invalidated &&
-          annotation.metadata.volumeId === volumeId
-        ) {
-          this._throttledCalculateCachedStats(
-            annotation,
-            annotationEnabledElement
-          );
-        }
+      if (
+        annotation.invalidated &&
+        annotationViewport?.hasVolumeId?.(metadata.volumeId)
+      ) {
+        this._throttledCalculateCachedStats(
+          annotation,
+          annotationEnabledElement
+        );
       }
 
       // If rendering engine has been destroyed while rendering
       if (!viewport.getRenderingEngine()) {
-        console.warn('Rendering Engine has been destroyed');
+        cs3dLogger.warn('Rendering Engine has been destroyed');
         return renderStatus;
       }
 
@@ -536,58 +543,27 @@ class CircleROIStartEndThresholdTool extends CircleROITool {
       renderStatus = true;
 
       if (this.configuration.showTextBox) {
-        const options = this.getLinkedTextBoxStyle(styleSpecifier, annotation);
-        if (!options.visibility) {
-          data.handles.textBox = {
-            hasMoved: false,
-            worldPosition: <Types.Point3>[0, 0, 0],
-            worldBoundingBox: {
-              topLeft: <Types.Point3>[0, 0, 0],
-              topRight: <Types.Point3>[0, 0, 0],
-              bottomLeft: <Types.Point3>[0, 0, 0],
-              bottomRight: <Types.Point3>[0, 0, 0],
-            },
-          };
-          continue;
-        }
         const textLines = this.configuration.getTextLines(data, { metadata });
         if (!textLines || textLines.length === 0) {
           continue;
         }
-
-        // Poor man's cached?
-        let canvasTextBoxCoords;
-
-        if (!data.handles.textBox.hasMoved) {
-          canvasTextBoxCoords = getTextBoxCoordsCanvas(canvasCorners);
-
-          data.handles.textBox.worldPosition =
-            viewport.canvasToWorld(canvasTextBoxCoords);
+        const linkAnchorPoints: Types.Point2[] = [
+          canvasCoordinates[0],
+          canvasCoordinates[1],
+        ];
+        if (
+          !this.renderLinkedTextBoxAnnotation({
+            enabledElement,
+            svgDrawingHelper,
+            annotation,
+            styleSpecifier,
+            textLines,
+            canvasCoordinates: linkAnchorPoints,
+            placementPoints: canvasCorners,
+          })
+        ) {
+          continue;
         }
-
-        const textBoxPosition = viewport.worldToCanvas(
-          data.handles.textBox.worldPosition
-        );
-
-        const textBoxUID = '1';
-        const boundingBox = drawLinkedTextBoxSvg(
-          svgDrawingHelper,
-          annotationUID,
-          textBoxUID,
-          textLines,
-          textBoxPosition,
-          [canvasCoordinates[0], canvasCoordinates[1]],
-          {},
-          options
-        );
-
-        const { x: left, y: top, width, height } = boundingBox;
-        data.handles.textBox.worldBoundingBox = {
-          topLeft: viewport.canvasToWorld([left, top]),
-          topRight: viewport.canvasToWorld([left + width, top]),
-          bottomLeft: viewport.canvasToWorld([left, top + height]),
-          bottomRight: viewport.canvasToWorld([left + width, top + height]),
-        };
       }
     }
     return renderStatus;
@@ -683,9 +659,15 @@ class CircleROIStartEndThresholdTool extends CircleROITool {
       basePos1,
       basePos2
     );
+    // The calibration compares the handles against the pixel bounds of the
+    // ultrasound regions of the image, so it reads index coordinates, as the
+    // other ROI tools pass.
+    const indexCoordinates = data.handles.points.map((point) =>
+      image.imageData.worldToIndex(point)
+    );
     const measureInfo = getCalibratedLengthUnitsAndScale(
       image,
-      data.handles.points
+      indexCoordinates
     );
     const aspect = getCalibratedAspect(image);
     const area = Math.abs(
@@ -703,13 +685,17 @@ class CircleROIStartEndThresholdTool extends CircleROITool {
       ),
     };
 
+    // The modality has to come from the volume being measured - the
+    // annotation metadata has no Modality, so reading it from there left PT
+    // statistics unitless instead of SUV.
+    const modality = imageVolume?.metadata?.Modality;
+
     const modalityUnit = getPixelValueUnits(
-      metadata.Modality,
+      modality,
       annotation.metadata.referencedImageId,
       modalityUnitOptions
     );
 
-    // console.debug(projectionPoints)
     for (let i = 0; i < projectionPoints.length; i++) {
       // If image does not exists for the targetId, skip. This can be due
       // to various reasons such as if the target was a volumeViewport, and
@@ -809,11 +795,10 @@ class CircleROIStartEndThresholdTool extends CircleROITool {
         pointsInsideVolume.push(pointsInShape);
       }
     }
-    // console.debug(pointsInsideVolume)
     const stats = this.configuration.statsCalculator.getStatistics();
     data.cachedStats.pointsInVolume = pointsInsideVolume;
     data.cachedStats.statistics = {
-      Modality: metadata.Modality,
+      Modality: modality,
       area,
       mean: stats.mean?.value,
       stdDev: stats.stdDev?.value,
@@ -830,8 +815,17 @@ class CircleROIStartEndThresholdTool extends CircleROITool {
     const { viewport } = enabledElement;
 
     const { cachedStats } = data;
-    const targetId = this.getTargetId(viewport);
-    const imageVolume = cache.getVolume(targetId.split(/volumeId:|\?/)[1]);
+    const target = this.getTargetVolume(viewport);
+
+    if (!target) {
+      // Clear the flag although no statistics were computed. The render
+      // callback calls this method for every invalidated annotation, so a
+      // flag that stays set repeats this work on every frame.
+      annotation.invalidated = false;
+      return cachedStats;
+    }
+
+    const { targetId, imageVolume } = target;
 
     // Todo: this shouldn't be here, this is a performance issue
     // Since we are extending the RectangleROI class, we need to

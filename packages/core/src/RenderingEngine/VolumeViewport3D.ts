@@ -4,12 +4,15 @@ import { OrientationAxis, Events } from '../enums';
 import cache from '../cache/cache';
 import setDefaultVolumeVOI from './helpers/setDefaultVolumeVOI';
 import triggerEvent from '../utilities/triggerEvent';
-import { actorIsA, isImageActor } from '../utilities/actorCheck';
-import { setTransferFunctionNodes } from '../utilities/transferFunctionUtils';
+import { actorIsA } from '../utilities/actorCheck';
 import type vtkVolume from '@kitware/vtk.js/Rendering/Core/Volume';
 import type { ViewportInput } from '../types/IViewport';
-import type { ImageActor } from '../types/IActor';
+import type { ResetCameraOptions } from '../types/ICamera';
 import BaseVolumeViewport from './BaseVolumeViewport';
+import {
+  sampleDistanceOf,
+  setIdleSampleDistanceMultiplier,
+} from './helpers/createVolumeMapper';
 import type { Types } from '@cornerstonejs/core';
 /**
  * An object representing a 3-dimensional volume viewport. VolumeViewport3Ds are used to render
@@ -45,22 +48,15 @@ class VolumeViewport3D extends BaseVolumeViewport {
         if (mapper && mapper.getInputData) {
           const imageData = mapper.getInputData();
 
-          if (imageData) {
-            const spacing = imageData.getSpacing();
+          if (imageData && mapper.setSampleDistance) {
+            setIdleSampleDistanceMultiplier(mapper, multiplier || 1);
+            const texture = (
+              mapper as unknown as { getScalarTexture?: () => unknown }
+            ).getScalarTexture?.();
 
-            //Calculate sample distance
-            const defaultSampleDistance =
-              (spacing[0] + spacing[1] + spacing[2]) / 6;
-
-            const sampleDistanceMultiplier = multiplier || 1;
-            let sampleDistance =
-              defaultSampleDistance * sampleDistanceMultiplier;
-
-            // Apply sample distance if specified
-            if (sampleDistance !== undefined && mapper.setSampleDistance) {
-              const currentSampleDistance = mapper.getSampleDistance();
-              mapper.setSampleDistance(sampleDistance);
-            }
+            mapper.setSampleDistance(
+              sampleDistanceOf(imageData, texture, multiplier || 1)
+            );
           }
         }
       }
@@ -81,8 +77,16 @@ class VolumeViewport3D extends BaseVolumeViewport {
     resetPan = true,
     resetZoom = true,
     resetToCenter = true,
-  } = {}): boolean {
-    super.resetCamera({ resetPan, resetZoom, resetToCenter });
+    resetAspectRatio = true,
+    storeAsInitialCamera = true,
+  }: ResetCameraOptions = {}): boolean {
+    super.resetCamera({
+      resetPan,
+      resetZoom,
+      resetToCenter,
+      resetAspectRatio,
+      storeAsInitialCamera,
+    });
     const activeCamera = this.getVtkActiveCamera();
 
     if (activeCamera.getParallelProjection()) {
@@ -157,16 +161,7 @@ class VolumeViewport3D extends BaseVolumeViewport {
 
     setDefaultVolumeVOI(volumeActor.actor as vtkVolume, imageVolume);
 
-    if (isImageActor(volumeActor)) {
-      const transferFunction = (volumeActor.actor as ImageActor)
-        .getProperty()
-        .getRGBTransferFunction(0);
-
-      setTransferFunctionNodes(
-        transferFunction,
-        this.initialTransferFunctionNodes
-      );
-    }
+    this._restoreVolumeRenderingDefaults(volumeActor, volumeId);
 
     this.setCamera(this.initialCamera);
     triggerEvent(

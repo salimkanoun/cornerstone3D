@@ -1,20 +1,20 @@
 import type vtkVolume from '@kitware/vtk.js/Rendering/Core/Volume';
 import vtkColorTransferFunction from '@kitware/vtk.js/Rendering/Core/ColorTransferFunction';
-import vtkColorMaps from '@kitware/vtk.js/Rendering/Core/ColorTransferFunction/ColorMaps';
-import vtkPiecewiseFunction from '@kitware/vtk.js/Common/DataModel/PiecewiseFunction';
 
 import { vec2, vec3 } from 'gl-matrix';
 import type { mat4 } from 'gl-matrix';
 import cache from '../cache/cache';
+import { coreLog } from '../utilities/logger';
 import {
   MPR_CAMERA_VALUES,
   RENDERING_DEFAULTS,
   VIEWPORT_PRESETS,
 } from '../constants';
-import type { BlendModes, InterpolationType, OrientationAxis } from '../enums';
+import type { BlendModes, InterpolationType } from '../enums';
 import {
   Events,
   MetadataModules,
+  OrientationAxis,
   ViewportStatus,
   VOILUTFunctionType,
 } from '../enums';
@@ -22,6 +22,7 @@ import ViewportType from '../enums/ViewportType';
 import eventTarget from '../eventTarget';
 import { getShouldUseCPURendering } from '../init';
 import type {
+  IDynamicImageVolume,
   ActorEntry,
   ColormapPublic,
   FlipDirection,
@@ -38,26 +39,42 @@ import type {
   ViewReference,
   IVolumeViewport,
   ICamera,
+  ViewportPreset,
 } from '../types';
 import type { VoiModifiedEventDetail } from '../types/EventTypes';
 import type { PlaneRestriction, ViewportInput } from '../types/IViewport';
 import triggerEvent from '../utilities/triggerEvent';
 import * as colormapUtils from '../utilities/colormap';
 import invertRgbTransferFunction from '../utilities/invertRgbTransferFunction';
-import createSigmoidRGBTransferFunction from '../utilities/createSigmoidRGBTransferFunction';
+import createLinearRGBTransferFunction from '../utilities/createLinearRGBTransferFunction';
+import { getValidVOILUTFunction } from '../utilities/voiLUTFunction';
+import { isRenderableVOILUT } from '../utilities/createVOILUTSequenceTransferFunction';
 import transformWorldToIndex from '../utilities/transformWorldToIndex';
 import {
   findMatchingColormap,
   updateOpacity as colormapUpdateOpacity,
   updateThreshold as colormapUpdateThreshold,
-  getThresholdValue,
-  getMaxOpacity,
+  updateOpacityMapping as colormapUpdateOpacityMapping,
+  getOpacityState,
 } from '../utilities/colormap';
-import { getTransferFunctionNodes } from '../utilities/transferFunctionUtils';
+import getAcquisitionPlaneOrientation from '../utilities/getAcquisitionPlaneOrientation';
+import {
+  getTransferFunctionNodes,
+  setTransferFunctionNodes,
+} from '../utilities/transferFunctionUtils';
 import type { TransferFunctionNodes } from '../types/ITransferFunctionNode';
 import type vtkCamera from '@kitware/vtk.js/Rendering/Core/Camera';
 
+import { createAndCacheVolume } from '../loaders/volumeLoader';
+import resolveViewportVolumeId from './helpers/resolveViewportVolumeId';
+import { getGenericViewportImageDisplaySet } from './GenericViewport/genericViewportDisplaySetAccess';
 import createVolumeActor from './helpers/createVolumeActor';
+import {
+  createVolumeVOITransferFunction,
+  getVolumeVOIShape,
+  volumeVOIIsCurve,
+} from './helpers/setDefaultVolumeVOI';
+import type { VolumeVOIShape } from './helpers/setDefaultVolumeVOI';
 import volumeNewImageEventDispatcher, {
   resetVolumeNewImageState,
 } from './helpers/volumeNewImageEventDispatcher';
@@ -65,7 +82,9 @@ import Viewport from './Viewport';
 import type { vtkSlabCamera as vtkSlabCameraType } from './vtkClasses/vtkSlabCamera';
 import vtkSlabCamera from './vtkClasses/vtkSlabCamera';
 import getVolumeViewportScrollInfo from '../utilities/getVolumeViewportScrollInfo';
-import { actorIsA } from '../utilities/actorCheck';
+import getViewSlabDepth from '../utilities/getViewSlabDepth';
+import { actorIsA, isImageActor } from '../utilities/actorCheck';
+import type { ImageActor } from '../types/IActor';
 import snapFocalPointToSlice from '../utilities/snapFocalPointToSlice';
 import getVoiFromSigmoidRGBTransferFunction from '../utilities/getVoiFromSigmoidRGBTransferFunction';
 import isEqual, { isEqualAbs, isEqualNegative } from '../utilities/isEqual';
@@ -77,10 +96,16 @@ import { isContextPoolRenderingEngine } from './helpers/isContextPoolRenderingEn
 import type vtkRenderer from '@kitware/vtk.js/Rendering/Core/Renderer';
 import mprCameraValues from '../constants/mprCameraValues';
 import { isInvalidNumber } from './helpers/isInvalidNumber';
+import getVolumeViewReferenceId from '../utilities/getVolumeViewReferenceId';
 import {
   createSharpeningRenderPass,
   createSmoothingRenderPass,
 } from './renderPasses';
+import type { FidelityLine } from './helpers/fidelityIndicator/fidelityIndicatorState';
+import {
+  type CachedRecord,
+  fidelityLinesFromVolumeActors,
+} from './helpers/fidelityIndicator/collectFidelityLines';
 /**
  * Abstract base class for volume viewports. VolumeViewports are used to render
  * 3D volumes from which various orientations can be viewed. Since VolumeViewports
@@ -90,6 +115,8 @@ import {
  * For setting volumes on viewports you need to use addVolumesToViewports
  * which will add volumes to the specified viewports.
  */
+const log = coreLog.getLogger('RenderingEngine', 'BaseVolumeViewport');
+
 abstract class BaseVolumeViewport extends Viewport {
   useCPURendering = false;
   private _FrameOfReferenceUID: string;
@@ -107,6 +134,126 @@ abstract class BaseVolumeViewport extends Viewport {
   protected initialViewUp: Point3;
   protected viewportProperties: VolumeViewportProperties = {};
   private volumeIds = new Set<string>();
+  /**
+   * The VOI LUT Function and the VOI LUT Sequence that the file of each volume
+   * specifies, by volumeId, together with the load state of the volume that the
+   * shape was read under. The shape is kept because a window level drag asks
+   * for it on every mouse move, and the load state lets one more read happen
+   * after the load completes. Refer to _getVolumeVOIShape.
+   */
+  private volumeVOIShapes = new Map<
+    string,
+    { shape: VolumeVOIShape; loaded: boolean }
+  >();
+  /**
+   * Whether the transfer function of a volume is a curve (a VOI LUT Sequence or
+   * a sigmoid) at the moment. A curve cannot become a window by a change of the
+   * range, because vtk.js rescales the nodes that it holds. Thus the transition
+   * needs a new transfer function.
+   */
+  private volumeVOICurveApplied = new Map<string, boolean>();
+  /**
+   * True when an application asked for a VOI LUT Function that is different
+   * from the function of the volume. Only one of the function and the VOI LUT
+   * Sequence can control the display.
+   */
+  private voiLUTFunctionSetByUser = false;
+  /** The `useVOILUTSequence` property, when an application set it. */
+  private useVOILUTSequence: boolean;
+  /** Quality-record cache for fidelity lines; cleared on volume data events. */
+  private _fidelityRecords = new Map<string, CachedRecord>();
+  private _fidelityRecordListenersAttached = false;
+  /** Set on ELEMENT_DISABLED of this element; the listeners never return. */
+  private _fidelityRecordsDisposed = false;
+  /** The pending animation frame of a coalesced fidelity notification. */
+  private _fidelityNotifyFrame = 0;
+
+  public canReportFidelity(): boolean {
+    return true;
+  }
+
+  protected collectFidelityLines(): FidelityLine[] {
+    this.ensureFidelityRecordInvalidation();
+    return fidelityLinesFromVolumeActors(this, this._fidelityRecords);
+  }
+
+  /**
+   * Adds the global listeners that clear the record cache on volume data
+   * events and fire `VIEWPORT_FIDELITY_CHANGED` when the state changed. The
+   * listeners are removed on ELEMENT_DISABLED of this element, so
+   * a disabled viewport does not stay in memory. `_reset` fires that event
+   * without `isDisabled`, so a disposed flag stops a later attach.
+   *
+   * A streaming load fires `IMAGE_VOLUME_MODIFIED` once for each image, and
+   * each state computation reads the quality record of the volume. The
+   * notification of that event therefore runs at most once for each animation
+   * frame, after the last event of the frame, so no update is lost.
+   * `IMAGE_VOLUME_LOADING_COMPLETED` notifies at once, and a render notifies
+   * through the rendering engine, so a user interaction is not delayed.
+   */
+  private ensureFidelityRecordInvalidation(): void {
+    if (
+      this._fidelityRecordListenersAttached ||
+      this._fidelityRecordsDisposed ||
+      this.isDisabled
+    ) {
+      return;
+    }
+    this._fidelityRecordListenersAttached = true;
+
+    const cancelFrame = () => {
+      cancelAnimationFrame(this._fidelityNotifyFrame);
+      this._fidelityNotifyFrame = 0;
+    };
+
+    const invalidate = (evt: Event) => {
+      const { volumeId } = (evt as CustomEvent<{ volumeId?: string }>).detail;
+      if (volumeId) {
+        this._fidelityRecords.delete(volumeId);
+      } else {
+        this._fidelityRecords.clear();
+      }
+      // A volume event can change the state with no render after it.
+      if (evt.type !== Events.IMAGE_VOLUME_MODIFIED) {
+        cancelFrame();
+        this.notifyFidelityStateChanged();
+      } else if (!this._fidelityNotifyFrame) {
+        this._fidelityNotifyFrame = requestAnimationFrame(() => {
+          this._fidelityNotifyFrame = 0;
+          if (!this._fidelityRecordsDisposed && !this.isDisabled) {
+            this.notifyFidelityStateChanged();
+          }
+        });
+      }
+    };
+
+    const cleanUp = (evt: Event) => {
+      // Match the element: a viewport of another engine can share the id.
+      if (
+        (evt as EventTypes.ElementDisabledEvent).detail?.element !==
+        this.element
+      ) {
+        return;
+      }
+
+      eventTarget.removeEventListener(Events.IMAGE_VOLUME_MODIFIED, invalidate);
+      eventTarget.removeEventListener(
+        Events.IMAGE_VOLUME_LOADING_COMPLETED,
+        invalidate
+      );
+      eventTarget.removeEventListener(Events.ELEMENT_DISABLED, cleanUp);
+      cancelFrame();
+      this._fidelityRecords.clear();
+      this._fidelityRecordsDisposed = true;
+    };
+
+    eventTarget.addEventListener(Events.IMAGE_VOLUME_MODIFIED, invalidate);
+    eventTarget.addEventListener(
+      Events.IMAGE_VOLUME_LOADING_COMPLETED,
+      invalidate
+    );
+    eventTarget.addEventListener(Events.ELEMENT_DISABLED, cleanUp);
+  }
 
   constructor(props: ViewportInput) {
     super(props);
@@ -141,10 +288,15 @@ abstract class BaseVolumeViewport extends Viewport {
     }
 
     this.initializeVolumeNewImageEventDispatcher();
+    this.initializeVolumeModifiedRenderDispatcher();
   }
 
   static get useCustomRenderingPipeline(): boolean {
     return false;
+  }
+
+  override isOrientationChangeable(): boolean {
+    return true;
   }
 
   public getSliceViewInfo(): {
@@ -191,7 +343,8 @@ abstract class BaseVolumeViewport extends Viewport {
     const volumeNewImageHandlerBound = volumeNewImageHandler.bind(this);
     const volumeNewImageCleanUpBound = volumeNewImageCleanUp.bind(this);
 
-    function volumeNewImageHandler(cameraEvent) {
+    function volumeNewImageHandler(event: Event) {
+      const cameraEvent = event as EventTypes.CameraModifiedEvent;
       const { viewportId } = cameraEvent.detail;
 
       if (viewportId !== this.id || this.isDisabled) {
@@ -243,25 +396,180 @@ abstract class BaseVolumeViewport extends Viewport {
   }
 
   /**
+   * Requests a render when a streaming volume that this viewport holds
+   * receives new frames. Legacy VolumeViewports otherwise never hear
+   * IMAGE_VOLUME_MODIFIED (GenericViewport paths do), so dirties piled up and
+   * rare paints uploaded hundreds of texture slices at once.
+   *
+   * While the volume loads, the loader renders every 2% of its frames
+   * (`autoRenderOnLoad`), and this dispatcher stays out of the way. It renders
+   * for a change after the load, such as a labelmap edit.
+   */
+  private initializeVolumeModifiedRenderDispatcher(): void {
+    const handleVolumeModified = (evt: Event) => {
+      const detail = (evt as CustomEvent<{ volumeId?: string }>).detail;
+      const volumeId = detail?.volumeId;
+
+      if (!volumeId || !this.volumeIds.has(volumeId) || this.isDisabled) {
+        return;
+      }
+
+      // A volume that is still loading renders through the throttle of its
+      // loader, so a 3D viewport does not ray cast on every frame.
+      if (cache.getVolume(volumeId)?.loadStatus?.loading) {
+        return;
+      }
+
+      this.renderVolumeModified(volumeId);
+    };
+
+    eventTarget.addEventListener(
+      Events.IMAGE_VOLUME_MODIFIED,
+      handleVolumeModified
+    );
+
+    const cleanUp = (evt: Event) => {
+      // Match the element: a viewport of another engine can share the id.
+      if (
+        (evt as EventTypes.ElementDisabledEvent).detail?.element !==
+        this.element
+      ) {
+        return;
+      }
+
+      eventTarget.removeEventListener(
+        Events.IMAGE_VOLUME_MODIFIED,
+        handleVolumeModified
+      );
+      eventTarget.removeEventListener(Events.ELEMENT_DISABLED, cleanUp);
+    };
+
+    eventTarget.addEventListener(Events.ELEMENT_DISABLED, cleanUp);
+  }
+
+  private renderVolumeModified(volumeId: string): void {
+    if (this.isDisabled) {
+      return;
+    }
+
+    const actors = this.getActors();
+
+    for (const entry of actors) {
+      const referencedId = entry.referencedId ?? entry.uid;
+
+      if (referencedId !== volumeId && entry.uid !== volumeId) {
+        continue;
+      }
+
+      const mapper = entry.actor?.getMapper?.();
+
+      mapper?.modified?.();
+    }
+
+    this.render();
+  }
+
+  /**
    * Sets the properties for the volume viewport on the volume
    * Sets the VOILUTFunction property for the volume viewport on the volume
    *
    * @param VOILUTFunction - Sets the voi mode (LINEAR or SAMPLED_SIGMOID)
    * @param volumeId - The volume id to set the properties for (if `undefined`, the first volume)
    * @param suppressEvents - If `true`, the viewport will not emit events
+   * @param voiRange - The window to keep, read before a change of
+   *   `useVOILUTSequence`. Default: the current window of the viewport.
    */
   private setVOILUTFunction(
     voiLUTFunction: VOILUTFunctionType,
     volumeId?: string,
-    suppressEvents?: boolean
+    suppressEvents?: boolean,
+    voiRange = this.getProperties(volumeId)?.voiRange
   ): void {
-    // make sure the VOI LUT function is valid in the VOILUTFunctionType which is enum
-    if (!Object.values(VOILUTFunctionType).includes(voiLUTFunction)) {
-      voiLUTFunction = VOILUTFunctionType.LINEAR;
-    }
-    const { voiRange } = this.getProperties();
+    // Normalize rather than test for a member of the enum: the value reaches us
+    // as a padded, lower case or single element array attribute from the
+    // providers as well as from an application, and an unknown value must
+    // become LINEAR rather than break the render.
+    const newVOILUTFunction = getValidVOILUTFunction(voiLUTFunction);
+
+    // Only a function that is different from the function of the volume stops
+    // the use of the VOI LUT Sequence. An absent (0028,1056) becomes LINEAR,
+    // and getProperties gives that value to the application. Thus an
+    // application that keeps the properties and sets them again must not stop
+    // the sequence with a LINEAR value that no person selected. This is the
+    // same rule as StackViewport and applyPlanarImagePresentation use.
+    this.voiLUTFunctionSetByUser =
+      newVOILUTFunction !==
+      getValidVOILUTFunction(this._getVolumeVOIShape(volumeId).voiLUTFunction);
+
+    // The property has to hold the new function before the transfer function is
+    // made from it. The old order built the transfer function from the previous
+    // function, so a request for SIGMOID had no effect until the next change of
+    // the VOI.
+    this.viewportProperties.VOILUTFunction = newVOILUTFunction;
     this.setVOI(voiRange, volumeId, suppressEvents);
-    this.viewportProperties.VOILUTFunction = voiLUTFunction;
+  }
+
+  /**
+   * The VOI LUT Function and the VOI LUT Sequence of the file of a volume.
+   */
+  private _getVolumeVOIShape(volumeId?: string): VolumeVOIShape {
+    const volumeIdToUse =
+      volumeId ?? this._getApplicableVolumeActor(volumeId)?.volumeId;
+
+    if (!volumeIdToUse) {
+      return {};
+    }
+
+    const volume = cache.getVolume(volumeIdToUse);
+    // The wadouri provider reads the VOI from the file of the instance, and
+    // that file arrives after the volume. Thus a shape that was read while the
+    // volume still loaded can be empty, and an empty shape is not yet the
+    // answer. Read the shape one more time when the load completes, and keep
+    // that second answer. Without this the volume lost the VOI LUT Sequence of
+    // the file for the life of the viewport.
+    const loaded = !!volume?.loadStatus?.loaded;
+    const cached = this.volumeVOIShapes.get(volumeIdToUse);
+
+    if (cached && (cached.loaded || !loaded)) {
+      return cached.shape;
+    }
+
+    const shape = getVolumeVOIShape(volume);
+
+    this.volumeVOIShapes.set(volumeIdToUse, { shape, loaded });
+
+    return shape;
+  }
+
+  /**
+   * The VOI LUT Sequence (0028,3010) of a volume, when it should control the
+   * display instead of an analytic VOI LUT Function. Refer to
+   * resolveVOILUTSequenceToApply for the rule. A colormap also stops it, which
+   * setVOI does for the sigmoid also.
+   */
+  private _getVOILUTSequenceToApply(volumeId?: string) {
+    if (this.useVOILUTSequence === false) {
+      return undefined;
+    }
+
+    if (this.useVOILUTSequence !== true && this.voiLUTFunctionSetByUser) {
+      return undefined;
+    }
+
+    const { voiLUT } = this._getVolumeVOIShape(volumeId);
+
+    return isRenderableVOILUT(voiLUT) ? voiLUT : undefined;
+  }
+
+  /**
+   * The VOI LUT Function in effect: the one that an application set, or the one
+   * that the file of the volume carries.
+   */
+  private _getVOILUTFunctionToApply(volumeId?: string): VOILUTFunctionType {
+    return getValidVOILUTFunction(
+      this.viewportProperties.VOILUTFunction ??
+        this._getVolumeVOIShape(volumeId).voiLUTFunction
+    );
   }
 
   /**
@@ -286,13 +594,7 @@ abstract class BaseVolumeViewport extends Viewport {
     const { volumeActor } = applicableVolumeActorInfo;
 
     const cfun = vtkColorTransferFunction.newInstance();
-    let colormapObj = colormapUtils.getColormap(colormap.name);
-
-    const { name } = colormap;
-
-    if (!colormapObj) {
-      colormapObj = vtkColorMaps.getPresetByName(name);
-    }
+    const colormapObj = colormapUtils.resolveColormap(colormap.name);
 
     if (!colormapObj) {
       throw new Error(`Colormap ${colormap} not found`);
@@ -306,11 +608,22 @@ abstract class BaseVolumeViewport extends Viewport {
     cfun.applyColorMap(colormapObj);
     cfun.setMappingRange(range[0], range[1]);
     volumeActor.getProperty().setRGBTransferFunction(0, cfun);
+    // The colormap replaces the transfer function. Thus a curve of a VOI LUT
+    // Sequence or of a sigmoid is no longer on the actor, and a later change of
+    // the VOI keeps the colors of the colormap.
+    this.volumeVOICurveApplied.set(applicableVolumeActorInfo.volumeId, false);
 
     // This configures the viewport to use the most recently applied colormap.
     // However, this approach is not optimal when dealing with two volumes, as it prevents retrieval of the
     // colormap for Volume A if Volume B's colormap was the last one applied.
     this.viewportProperties.colormap = colormap;
+
+    // Seed the opacity spec from the incoming colormap (if it carries opacity/mapping) BEFORE the
+    // events below fire. setColormap emits VOI_MODIFIED/COLORMAP_MODIFIED ahead of setProperties'
+    // separate setOpacity call, so without this getColormap would report a flattened fallback and
+    // any synchronizer listening to those events would propagate a flattened opacity to the other
+    // viewports — re-introducing the TMTV fusion red background.
+    this._applyColormapOpacity(colormap, volumeActor);
 
     if (!suppressEvents) {
       const completeColormap = this.getColormap(volumeId);
@@ -322,6 +635,32 @@ abstract class BaseVolumeViewport extends Viewport {
       };
       triggerEvent(this.element, Events.VOI_MODIFIED, eventDetail);
       triggerEvent(this.element, Events.COLORMAP_MODIFIED, eventDetail);
+    }
+  }
+
+  /**
+   * Applies the opacity carried by a public colormap to the volume actor. Opacity has two
+   * orthogonal parts that must not overwrite each other:
+   *  - a scalar "overall" level (e.g. the fusion/master slider), and
+   *  - a per-value mapping (e.g. a hanging-protocol opacity array).
+   * For backward compatibility an array passed in `opacity` is treated as the mapping. The
+   * rendered function is overall * mapping(v), derived from a per-actor spec so a later slider or
+   * threshold change re-derives instead of flattening (see utilities/colormap). If the colormap
+   * carries neither, the existing spec is left untouched (e.g. a pure LUT-name change).
+   */
+  private _applyColormapOpacity(colormap: ColormapPublic, volumeActor): void {
+    const mapping = Array.isArray(colormap.opacityMapping)
+      ? colormap.opacityMapping
+      : Array.isArray(colormap.opacity)
+        ? colormap.opacity
+        : undefined;
+    const overall =
+      typeof colormap.opacity === 'number' ? colormap.opacity : undefined;
+
+    if (mapping !== undefined) {
+      colormapUpdateOpacityMapping(volumeActor, mapping, overall);
+    } else if (overall !== undefined) {
+      colormapUpdateOpacity(volumeActor, overall);
     }
   }
 
@@ -340,22 +679,16 @@ abstract class BaseVolumeViewport extends Viewport {
     }
     const { volumeActor } = applicableVolumeActorInfo;
 
-    const ofun = vtkPiecewiseFunction.newInstance();
-    if (typeof colormap.opacity === 'number') {
-      // Use the new utility to update opacity while preserving threshold
-      colormapUpdateOpacity(volumeActor, colormap.opacity);
-    } else {
-      colormap.opacity.forEach(({ opacity, value }) => {
-        ofun.addPoint(value, opacity);
-      });
-      volumeActor.getProperty().setScalarOpacity(0, ofun);
-    }
+    this._applyColormapOpacity(colormap, volumeActor);
 
     if (!this.viewportProperties.colormap) {
       this.viewportProperties.colormap = {};
     }
 
-    this.viewportProperties.colormap.opacity = colormap.opacity;
+    // Mirror the resolved state (scalar opacity + per-value mapping) into the stored colormap.
+    const { opacity, opacityMapping } = getOpacityState(volumeActor);
+    this.viewportProperties.colormap.opacity = opacity;
+    this.viewportProperties.colormap.opacityMapping = opacityMapping;
 
     const matchedColormap = this.getColormap(volumeId);
     const eventDetail = {
@@ -412,25 +745,30 @@ abstract class BaseVolumeViewport extends Viewport {
       throw new Error(`No actor found for the given volumeId: ${volumeId}`);
     }
 
-    const volumeActor = applicableVolumeActorInfo.volumeActor;
-
-    const transferFunction = volumeActor
-      .getProperty()
-      .getRGBTransferFunction(0);
-
-    const range = transferFunction.getMappingRange();
-
     const matchedColormap = this.getColormap(volumeId);
-    const { VOILUTFunction, invert } = this.getProperties(volumeId);
+    // The mapping range of the transfer function is only the VOI for a linear
+    // function. A sampled sigmoid bakes its curve into the nodes, so its
+    // mapping range is the whole node domain (~3.3x the window width, and
+    // off-center) - getProperties decodes the real window back out of it.
+    const { VOILUTFunction, invert, voiRange } = this.getProperties(volumeId);
 
     return {
       viewportId: this.id,
       range: {
-        lower: range[0],
-        upper: range[1],
+        lower: voiRange.lower,
+        upper: voiRange.upper,
       },
       volumeId: applicableVolumeActorInfo.volumeId,
       VOILUTFunction: VOILUTFunction,
+      // What reached the actor, and not what the file asks for: a colormap
+      // replaces the curve of the sequence, and setColormap then records that
+      // no curve is on the actor. StackViewport reports the applied state in
+      // the same way. A sequence always wins over a sigmoid in
+      // createVolumeVOITransferFunction, so a recorded curve plus a sequence
+      // that applies means the curve is the curve of the sequence.
+      voiLUTSequenceApplied:
+        !!this._getVOILUTSequenceToApply(volumeId) &&
+        !!this.volumeVOICurveApplied.get(applicableVolumeActorInfo.volumeId),
       colormap: matchedColormap,
       invert,
     };
@@ -510,29 +848,69 @@ abstract class BaseVolumeViewport extends Viewport {
     }
 
     if ([voiRangeToUse.lower, voiRangeToUse.upper].some(isInvalidNumber)) {
-      console.warn(
+      log.warn(
         'VOI range contains invalid values, ignoring setVOI request',
         voiRangeToUse
       );
       return;
     }
 
-    const { VOILUTFunction } = this.getProperties(volumeIdToUse);
-
     // scaling logic here
     // https://github.com/Kitware/vtk-js/blob/c6f2e12cddfe5c0386a73f0793eb6d9ab20d573e/Sources/Rendering/OpenGL/VolumeMapper/index.js#L957-L972
-    if (VOILUTFunction === VOILUTFunctionType.SAMPLED_SIGMOID) {
-      const cfun = createSigmoidRGBTransferFunction(voiRangeToUse);
-      volumeActor.getProperty().setRGBTransferFunction(0, cfun);
-    } else {
-      // TODO: refactor and make it work for PET series (inverted/colormap)
-      // const cfun = createLinearRGBTransferFunction(voiRangeToUse);
-      // volumeActor.getProperty().setRGBTransferFunction(0, cfun);
+    // A VOI LUT Sequence of the file and the SIGMOID function are curves. Thus
+    // they need their own transfer function. The curve of a sequence is
+    // stretched over the range. Thus window level reshapes the curve and does
+    // not replace it, as on the stack and the generic viewports.
+    //
+    // A colormap stops both curves. A colormap is a choice of a person, and it
+    // fills the transfer function with its own colors. The generic viewports
+    // use the same rule (refer to createPlanarRGBTransferFunction).
+    let curve;
 
-      // Todo: Moving from LINEAR to SIGMOID and back to LINEAR will not
-      // work until we implement it in a different way because the
-      // LINEAR transfer function is not recreated.
-      const { lower, upper } = voiRangeToUse;
+    if (!this.viewportProperties.colormap?.name) {
+      curve = createVolumeVOITransferFunction({
+        voiRange: voiRangeToUse,
+        voiLUT: this._getVOILUTSequenceToApply(volumeIdToUse),
+        voiLUTFunction: this._getVOILUTFunctionToApply(volumeIdToUse),
+      });
+    }
+
+    const { lower, upper } = voiRangeToUse;
+
+    if (curve) {
+      // A transfer function that is made anew carries no inversion, and
+      // setInvert inverts only the one that is on the actor at the time. Thus
+      // carry the inversion over here, or a window level drag on a curve loses
+      // the inversion of a MONOCHROME1 volume and the inversion that a person
+      // chose. StackViewport.setVOIGPU does the same on the stack path.
+      if (this.viewportProperties.invert) {
+        invertRgbTransferFunction(curve);
+      }
+
+      volumeActor.getProperty().setRGBTransferFunction(0, curve);
+      this.volumeVOICurveApplied.set(volumeIdToUse, true);
+    } else if (this.volumeVOICurveApplied.get(volumeIdToUse)) {
+      // A curve holds hundreds of nodes, and setRange only rescales them. Thus
+      // the shape of the curve stays after the reason for it goes away
+      // (`useVOILUTSequence: false`, or a move back to LINEAR). Make the window
+      // again from nothing.
+      this.volumeVOICurveApplied.set(volumeIdToUse, false);
+      volumeActor
+        .getProperty()
+        .setRGBTransferFunction(
+          0,
+          createLinearRGBTransferFunction(voiRangeToUse)
+        );
+
+      if (this.viewportProperties.invert) {
+        invertRgbTransferFunction(
+          volumeActor.getProperty().getRGBTransferFunction(0)
+        );
+      }
+    } else {
+      // Todo: refactor and make it work for PET series (inverted/colormap)
+      // A range on the existing transfer function keeps the colormap and the
+      // inversion that it carries.
       volumeActor
         .getProperty()
         .getRGBTransferFunction(0)
@@ -639,8 +1017,17 @@ abstract class BaseVolumeViewport extends Viewport {
   ): ViewReference {
     const target = super.getViewReference(viewRefSpecifier);
     const volumeId = this.getVolumeId(viewRefSpecifier);
-    if (viewRefSpecifier?.forFrameOfReference !== false) {
+    // Include the volumeId unless a frame-of-reference reference was
+    // explicitly requested (forFrameOfReference === true), since such a
+    // reference is not volume specific and must not carry a volumeId.  The
+    // default and forFrameOfReference === false both bind to this volume.
+    // Keep this in sync with planarViewReference (the generic viewports).
+    if (viewRefSpecifier?.forFrameOfReference !== true) {
       target.volumeId = volumeId;
+    }
+    const dimensionGroupNumber = this._getDimensionGroupNumber(volumeId);
+    if (dimensionGroupNumber) {
+      target.dimensionGroupNumber = dimensionGroupNumber;
     }
     if (typeof viewRefSpecifier?.sliceIndex !== 'number') {
       return target;
@@ -684,6 +1071,17 @@ abstract class BaseVolumeViewport extends Viewport {
       return false;
     }
     if (!super.isReferenceViewable(viewRef, options)) {
+      return false;
+    }
+    const dimensionGroupNumber = this._getDimensionGroupNumber(
+      this.getVolumeId({ volumeId: viewRef.volumeId })
+    );
+    if (
+      !options?.withNavigation &&
+      viewRef.dimensionGroupNumber &&
+      dimensionGroupNumber &&
+      viewRef.dimensionGroupNumber !== dimensionGroupNumber
+    ) {
       return false;
     }
     if (options?.withNavigation) {
@@ -743,7 +1141,7 @@ abstract class BaseVolumeViewport extends Viewport {
    * 2. If dot products of the current view plane normal and inPlaneVector 1 and 2 are zero, no change
    *
    */
-  public setBestOrentation(inPlaneVector1, inPlaneVector2) {
+  public setBestOrentation(inPlaneVector1: Point3, inPlaneVector2: Point3) {
     if (!inPlaneVector1 && !inPlaneVector2) {
       // Any view is compatible with a point position
       return;
@@ -803,10 +1201,19 @@ abstract class BaseVolumeViewport extends Viewport {
 
     this.setBestOrentation(inPlaneVector1, inPlaneVector2);
 
+    const { focalPoint, viewPlaneNormal } = this.getCamera();
+    const deltaFocal = vec3.subtract(vec3.create(), point, focalPoint);
+    const alongNormal = vec3.dot(deltaFocal, viewPlaneNormal);
+    const deltaNormal = vec3.scaleAndAdd(
+      vec3.create(),
+      focalPoint,
+      viewPlaneNormal,
+      alongNormal
+    ) as Point3;
     this.setViewReference({
       FrameOfReferenceUID,
-      cameraFocalPoint: point,
-      viewPlaneNormal: this.getCamera().viewPlaneNormal,
+      cameraFocalPoint: deltaNormal,
+      viewPlaneNormal: viewPlaneNormal,
     });
   }
 
@@ -827,6 +1234,21 @@ abstract class BaseVolumeViewport extends Viewport {
       viewUp,
     } = viewRef;
     let { sliceIndex } = viewRef;
+
+    // The time point belongs to the referenced volume, for example the PET of a fusion.
+    const timePointVolumeId = this.getVolumeId({ volumeId: viewRef.volumeId });
+    const timePointVolume =
+      timePointVolumeId &&
+      this._getDimensionGroupNumber(timePointVolumeId) &&
+      (cache.getVolume(timePointVolumeId) as IDynamicImageVolume);
+    if (
+      timePointVolume &&
+      viewRef.dimensionGroupNumber &&
+      viewRef.dimensionGroupNumber <= timePointVolume.numDimensionGroups &&
+      refFrameOfReference === this.getFrameOfReferenceUID()
+    ) {
+      timePointVolume.dimensionGroupNumber = viewRef.dimensionGroupNumber;
+    }
 
     if (planeRestriction && !refViewPlaneNormal) {
       return this.setViewPlane(planeRestriction);
@@ -1003,6 +1425,7 @@ abstract class BaseVolumeViewport extends Viewport {
     {
       voiRange,
       VOILUTFunction,
+      useVOILUTSequence,
       invert,
       colormap,
       preset,
@@ -1020,6 +1443,7 @@ abstract class BaseVolumeViewport extends Viewport {
       this.setDefaultProperties({
         voiRange,
         VOILUTFunction,
+        useVOILUTSequence,
         invert,
         colormap,
         preset,
@@ -1039,11 +1463,22 @@ abstract class BaseVolumeViewport extends Viewport {
     if (colormap?.name) {
       this.setColormap(colormap, volumeId, suppressEvents);
     }
-    if (colormap?.opacity != null) {
+    if (colormap?.opacity != null || colormap?.opacityMapping != null) {
       this.setOpacity(colormap, volumeId);
     }
     if (colormap?.threshold != null) {
       this.setThreshold(colormap, volumeId);
+    }
+
+    // Read the window before the sequence setting changes how getProperties
+    // decodes it: a sigmoid read as a sequence gives its wide node domain.
+    const currentVOIRange =
+      useVOILUTSequence !== undefined && voiRange === undefined
+        ? this.getProperties(volumeId)?.voiRange
+        : undefined;
+
+    if (useVOILUTSequence !== undefined) {
+      this.useVOILUTSequence = useVOILUTSequence;
     }
 
     if (voiRange !== undefined) {
@@ -1055,7 +1490,22 @@ abstract class BaseVolumeViewport extends Viewport {
     }
 
     if (VOILUTFunction !== undefined) {
-      this.setVOILUTFunction(VOILUTFunction, volumeId, suppressEvents);
+      this.setVOILUTFunction(
+        VOILUTFunction,
+        volumeId,
+        suppressEvents,
+        currentVOIRange
+      );
+    } else if (useVOILUTSequence !== undefined && voiRange === undefined) {
+      // A change of useVOILUTSequence changes the transfer function, but it
+      // does not change the VOI LUT Function or the range. Thus set the current
+      // function again to make the new transfer function.
+      this.setVOILUTFunction(
+        this._getVOILUTFunctionToApply(volumeId),
+        volumeId,
+        suppressEvents,
+        currentVOIRange
+      );
     }
 
     if (preset !== undefined) {
@@ -1126,16 +1576,55 @@ abstract class BaseVolumeViewport extends Viewport {
 
       return renderPasses.length ? renderPasses : null;
     } catch (e) {
-      console.warn('Failed to create custom render passes:', e);
+      log.warn('Failed to create custom render passes:', e);
       return null;
     }
   };
+
+  /**
+   * Restores the default visual transfer function for a volume actor on reset.
+   * If the viewport has a configured default preset or colormap, it re-applies
+   * them via setProperties to restore the full visual state (color TF, opacity,
+   * lighting). Otherwise, it falls back to the initial transfer function nodes
+   * captured at volume load time.
+   *
+   * @param volumeActor - The actor entry for the volume
+   * @param volumeId - The id of the volume
+   */
+  protected _restoreVolumeRenderingDefaults(
+    volumeActor: ActorEntry,
+    volumeId: string
+  ): void {
+    if (!isImageActor(volumeActor)) {
+      return;
+    }
+
+    const properties = this.getDefaultProperties(volumeId);
+
+    if (properties?.preset || properties?.colormap) {
+      this.setProperties(properties, volumeId, true);
+    } else {
+      const transferFunction = (volumeActor.actor as ImageActor)
+        .getProperty()
+        .getRGBTransferFunction(0);
+
+      setTransferFunctionNodes(
+        transferFunction,
+        this.initialTransferFunctionNodes
+      );
+    }
+  }
 
   /**
    * Reset the viewport properties to the default values
    */
   public resetToDefaultProperties(volumeId: string): void {
     const properties = this.globalDefaultProperties;
+    const currentVOIRange = this.getProperties(volumeId)?.voiRange;
+
+    this.voiLUTFunctionSetByUser = false;
+    this.useVOILUTSequence = properties.useVOILUTSequence;
+    this.viewportProperties.VOILUTFunction = properties.VOILUTFunction;
 
     if (properties.colormap?.name) {
       this.setColormap(properties.colormap, volumeId);
@@ -1150,6 +1639,10 @@ abstract class BaseVolumeViewport extends Viewport {
 
     if (properties.VOILUTFunction !== undefined) {
       this.setVOILUTFunction(properties.VOILUTFunction, volumeId);
+    } else if (properties.voiRange === undefined && currentVOIRange) {
+      // The cleared flags can change the required transfer function even when
+      // no saved default has a VOI value.
+      this.setVOI(currentVOIRange, volumeId);
     }
 
     if (properties.invert !== undefined) {
@@ -1175,13 +1668,17 @@ abstract class BaseVolumeViewport extends Viewport {
   /**
    * Sets the specified preset for the volume with the given ID
    *
-   * @param presetName - The name of the preset to apply (e.g., "CT-Bone").
+   * @param presetNameOrObj - The preset to apply, either as a name (e.g. "CT-Bone") or as a ViewportPreset object.
    * @param volumeId - The ID of the volume to set the preset for.
    * @param suppressEvents - If `true`, events will not be emitted during the preset application.
    *
    * @returns void
    */
-  private setPreset(presetNameOrObj, volumeId, suppressEvents) {
+  private setPreset(
+    presetNameOrObj: string | ViewportPreset,
+    volumeId: string,
+    suppressEvents: boolean
+  ) {
     const applicableVolumeActorInfo = this._getApplicableVolumeActor(volumeId);
 
     if (!applicableVolumeActorInfo) {
@@ -1190,21 +1687,20 @@ abstract class BaseVolumeViewport extends Viewport {
 
     const { volumeActor } = applicableVolumeActorInfo;
 
-    let preset = presetNameOrObj;
+    const viewportPreset: ViewportPreset | undefined =
+      typeof presetNameOrObj === 'string'
+        ? VIEWPORT_PRESETS.find((preset) => preset.name === presetNameOrObj)
+        : presetNameOrObj;
 
-    if (typeof preset === 'string') {
-      preset = VIEWPORT_PRESETS.find((preset) => {
-        return preset.name === presetNameOrObj;
-      });
-    }
-
-    if (!preset) {
+    if (!viewportPreset) {
       return;
     }
 
-    applyPreset(volumeActor, preset);
+    applyPreset(volumeActor, viewportPreset);
+    // The preset replaces the transfer function, as a colormap does.
+    this.volumeVOICurveApplied.set(applicableVolumeActorInfo.volumeId, false);
 
-    this.viewportProperties.preset = preset;
+    this.viewportProperties.preset = viewportPreset.name;
     this.render();
 
     if (!suppressEvents) {
@@ -1212,12 +1708,12 @@ abstract class BaseVolumeViewport extends Viewport {
         viewportId: this.id,
         volumeId: applicableVolumeActorInfo.volumeId,
         actor: volumeActor,
-        presetName: preset.name,
+        presetName: viewportPreset.name,
       });
     }
   }
 
-  public setSampleDistanceMultiplier(multiplier: number): void {}
+  public setSampleDistanceMultiplier(_multiplier: number): void {}
 
   /**
    * Retrieve the viewport default properties
@@ -1228,7 +1724,7 @@ abstract class BaseVolumeViewport extends Viewport {
   public getDefaultProperties = (
     volumeId?: string
   ): VolumeViewportProperties => {
-    let volumeProperties;
+    let volumeProperties: VolumeViewportProperties | undefined;
     if (volumeId !== undefined) {
       volumeProperties = this.perVolumeIdDefaultProperties.get(volumeId);
     }
@@ -1247,7 +1743,9 @@ abstract class BaseVolumeViewport extends Viewport {
    * @param volumeId - The volume id to get the properties for (if undefined, the first volume)
    * @returns viewport properties including voi, interpolation type: TODO: slabThickness, invert
    */
-  public getProperties = (volumeId?: string): VolumeViewportProperties => {
+  public getProperties = (
+    volumeId?: string
+  ): VolumeViewportProperties | undefined | null => {
     const applicableVolumeActorInfo = this._getApplicableVolumeActor(volumeId);
     if (!applicableVolumeActorInfo) {
       return;
@@ -1255,12 +1753,15 @@ abstract class BaseVolumeViewport extends Viewport {
 
     const {
       colormap: latestColormap,
-      VOILUTFunction,
       interpolationType,
       invert,
       slabThickness,
       preset,
     } = this.viewportProperties;
+    // The function of the file when no application set one, as on the stack
+    // viewport. An application that reads the properties and sets them again
+    // then keeps the VOI LUT Sequence of the file.
+    const VOILUTFunction = this._getVOILUTFunctionToApply(volumeId);
 
     volumeId ||= this.getVolumeId();
     const volume = cache.getVolume(volumeId);
@@ -1279,10 +1780,20 @@ abstract class BaseVolumeViewport extends Viewport {
 
     const volumeActor = volumeActorEntry.actor as vtkVolume;
     const cfun = volumeActor.getProperty().getRGBTransferFunction(0);
-    const [lower, upper] =
-      this.viewportProperties?.VOILUTFunction === 'SIGMOID'
-        ? getVoiFromSigmoidRGBTransferFunction(cfun)
-        : cfun.getRange();
+    // Solve the transfer function for a window only when a sigmoid is what the
+    // actor holds. The function in effect is not enough to know that: a
+    // colormap and a VOI LUT Sequence each replace the curve (refer to
+    // setVOI), while a SIGMOID value of (0028,1056) stays in effect over both.
+    // Solving a colormap ramp for a window takes log((1 - y) / y) of 0 or of 1,
+    // thus an infinite width and a range of NaN, and the next setVOI then
+    // rejects that range and leaves window level inert on the viewport.
+    const sigmoidApplied =
+      VOILUTFunction === VOILUTFunctionType.SAMPLED_SIGMOID &&
+      !!this.volumeVOICurveApplied.get(volumeId) &&
+      !this._getVOILUTSequenceToApply(volumeId);
+    const [lower, upper] = sigmoidApplied
+      ? getVoiFromSigmoidRGBTransferFunction(cfun)
+      : cfun.getRange();
 
     const voiRange = { lower, upper };
 
@@ -1295,6 +1806,8 @@ abstract class BaseVolumeViewport extends Viewport {
       colormap: colormap,
       voiRange: voiRange,
       VOILUTFunction: VOILUTFunction,
+      voiLUTFunctionSetByUser: this.voiLUTFunctionSetByUser,
+      useVOILUTSequence: this.useVOILUTSequence,
       interpolationType: interpolationType,
       invert: invert,
       slabThickness: slabThickness,
@@ -1317,7 +1830,7 @@ abstract class BaseVolumeViewport extends Viewport {
    * @param applicableVolumeActorInfo  - The volume actor information for the volume
    * @returns colormap information for the volume if identified
    */
-  private getColormap = (volumeId) => {
+  private getColormap = (volumeId: string) => {
     const applicableVolumeActorInfo = this._getApplicableVolumeActor(volumeId);
 
     if (!applicableVolumeActorInfo) {
@@ -1335,11 +1848,12 @@ abstract class BaseVolumeViewport extends Viewport {
 
     const matchedColormap = findMatchingColormap(RGBPoints, volumeActor) || {};
 
-    const threshold = getThresholdValue(volumeActor);
-    const opacity = getMaxOpacity(volumeActor);
-
-    matchedColormap.threshold = threshold;
+    // Report the scalar overall opacity (as a number, for the slider) alongside the per-value
+    // mapping, so both can be read back and synchronized without one collapsing the other.
+    const { opacity, opacityMapping, threshold } = getOpacityState(volumeActor);
     matchedColormap.opacity = opacity;
+    matchedColormap.opacityMapping = opacityMapping;
+    matchedColormap.threshold = threshold;
 
     return matchedColormap;
   };
@@ -1358,6 +1872,10 @@ abstract class BaseVolumeViewport extends Viewport {
     immediate = false,
     suppressEvents = false
   ): Promise<void> {
+    // Setting raw volumes directly resets any display-set bookkeeping; the
+    // setDisplaySets override re-records after calling this.
+    this.clearDisplaySets();
+
     const volumeId = volumeInputArray[0].volumeId;
     const firstImageVolume = cache.getVolume(volumeId);
 
@@ -1418,6 +1936,49 @@ abstract class BaseVolumeViewport extends Viewport {
     if (immediate) {
       this.render();
     }
+  }
+
+  /**
+   * Mounts display sets on the viewport, mirroring the GenericViewport
+   * `setDisplaySets` API. The `displaySetId` is resolved through the registered
+   * generic-viewport dataset metadata (see `genericViewportDisplaySetMetadataProvider`)
+   * to its `imageIds`; a volume is created/cached from them (if not already
+   * present) and loaded via `setVolumes`. Per-entry `options` (e.g. `callback`,
+   * `blendMode`, `slabThickness`) are forwarded to the volume input. Resolution
+   * and loading run inside {@link mountDisplaySets}, which records the mounted
+   * entries after `setVolumes` so {@link getDisplaySets} reports them.
+   *
+   * @param entries - display set entries to mount; the first provides the volume.
+   */
+  public async setDisplaySets(
+    ...entries: Array<{ displaySetId: string; options?: unknown }>
+  ): Promise<void> {
+    await this.mountDisplaySets(entries, async (entry) => {
+      const dataSet = getGenericViewportImageDisplaySet(entry.displaySetId);
+      if (!dataSet?.imageIds?.length) {
+        throw new Error(
+          `[VolumeViewport] No registered imageIds for display set ${entry.displaySetId}`
+        );
+      }
+
+      const volumeId = resolveViewportVolumeId(
+        (dataSet.volumeId as string) ?? entry.displaySetId
+      );
+
+      if (!cache.getVolume(volumeId)) {
+        const volume = await createAndCacheVolume(volumeId, {
+          imageIds: dataSet.imageIds,
+        });
+        volume.load();
+      }
+
+      const volumeInput = {
+        volumeId,
+        ...((entry.options as Record<string, unknown>) ?? {}),
+      } as IVolumeInput;
+
+      await this.setVolumes([volumeInput]);
+    });
   }
 
   /**
@@ -1484,6 +2045,10 @@ abstract class BaseVolumeViewport extends Viewport {
 
     this.addActors(volumeActors);
 
+    // Before initializeColorTransferFunction, and before any colormap: a
+    // colormap replaces the curve, and setColormap records that itself.
+    this._recordVolumeVOICurves(volumeActors);
+
     this.initializeColorTransferFunction(volumeInputArray);
 
     if (immediate) {
@@ -1523,7 +2088,7 @@ abstract class BaseVolumeViewport extends Viewport {
     _immediate = true,
     _suppressEvents = false
   ): void {
-    console.warn('Method "setOrientation" needs implementation');
+    log.warn('Method "setOrientation" needs implementation');
   }
 
   /**
@@ -1533,7 +2098,7 @@ abstract class BaseVolumeViewport extends Viewport {
    * @param getTransferFunctionNodes - Function to get the transfer function nodes.
    * @returns void
    */
-  private initializeColorTransferFunction(volumeInputArray) {
+  private initializeColorTransferFunction(volumeInputArray: IVolumeInput[]) {
     const selectedVolumeId = volumeInputArray[0].volumeId;
     const colorTransferFunction =
       this._getOrCreateColorTransferFunction(selectedVolumeId);
@@ -1718,7 +2283,7 @@ abstract class BaseVolumeViewport extends Viewport {
       (actor) => actor.referencedId === volumeId
     );
 
-    if (!actorIsA(actorEntry, 'vtkVolume')) {
+    if (!actorEntry || !actorIsA(actorEntry, 'vtkVolume')) {
       return;
     }
 
@@ -1776,7 +2341,40 @@ abstract class BaseVolumeViewport extends Viewport {
     for (let i = 0; i < volumeActorEntries.length; i++) {
       this.viewportProperties.invert = false;
     }
+
+    // A new set of volumes replaces every volume. Thus drop what the previous
+    // volumes recorded before the new actors are recorded.
+    this.voiLUTFunctionSetByUser = false;
+    this.volumeVOICurveApplied.clear();
+    this.volumeVOIShapes.clear();
+
+    this._recordVolumeVOICurves(volumeActorEntries);
+
     this.setActors(volumeActorEntries);
+  }
+
+  /**
+   * Records which of the given actors setDefaultVolumeVOI gave a curve to, so
+   * that a later change of the VOI knows that a range on that transfer function
+   * cannot remove the curve.
+   *
+   * Both _setVolumeActors and addVolumes call this. addVolumes adds an actor to
+   * the actors that are already on the viewport, and it must not drop what the
+   * other volumes recorded. Without the call from addVolumes, a fusion volume
+   * whose file gives a sigmoid or a VOI LUT Sequence had no record. Then
+   * getProperties reported the whole node domain of the curve as the VOI, which
+   * is about 3.3 times the window width for a sigmoid, and the window level tool
+   * and setVOILUTFunction both start from that value.
+   */
+  private _recordVolumeVOICurves(volumeActorEntries: ActorEntry[]): void {
+    for (const actorEntry of volumeActorEntries) {
+      const volumeId = actorEntry.referencedId;
+
+      this.volumeVOICurveApplied.set(
+        volumeId,
+        volumeVOIIsCurve(this._getVolumeVOIShape(volumeId))
+      );
+    }
   }
 
   /**
@@ -1863,7 +2461,7 @@ abstract class BaseVolumeViewport extends Viewport {
 
     const renderer = this.getRenderer();
     const devicePixelRatio = window.devicePixelRatio || 1;
-    const { width, height } = this.canvas;
+    const { width, height } = this.getRenderedCanvasSize();
     const aspectRatio = width / height;
 
     // Get the actual renderer viewport bounds
@@ -1944,7 +2542,7 @@ abstract class BaseVolumeViewport extends Viewport {
     ];
 
     const renderer = this.getRenderer();
-    const { width, height } = this.canvas;
+    const { width, height } = this.getRenderedCanvasSize();
 
     // Get the actual renderer viewport bounds
     const [xMin, yMin, xMax, yMax] =
@@ -2056,7 +2654,7 @@ abstract class BaseVolumeViewport extends Viewport {
     vtkCamera.setIsPerformingCoordinateTransformation?.(true);
 
     const renderer = this.getRenderer();
-    const { width, height } = this.canvas;
+    const { width, height } = this.getRenderedCanvasSize();
     const aspectRatio = width / height;
 
     // Get the actual renderer viewport bounds
@@ -2161,7 +2759,7 @@ abstract class BaseVolumeViewport extends Viewport {
    * for axial, sagittal and coronal
    * Otherwise runs the Gram-Schmidt algorithm with the current viewUp
    */
-  protected _getViewUp(viewPlaneNormal): Point3 {
+  protected _getViewUp(viewPlaneNormal: Point3): Point3 {
     const { viewUp } = this.getCamera();
     const dot = vec3.dot(viewUp, viewPlaneNormal);
     if (isEqual(dot, 0)) {
@@ -2200,14 +2798,32 @@ abstract class BaseVolumeViewport extends Viewport {
         );
       }
     } else if (typeof orientation === 'string') {
-      if (orientation === 'acquisition') {
+      if (orientation === OrientationAxis.ACQUISITION) {
         return this._getAcquisitionPlaneOrientation();
-      } else if (
-        orientation === 'reformat' ||
-        (orientation as string).includes('_reformat')
-      ) {
+      } else if (orientation === OrientationAxis.REFORMAT) {
+        // Generic reformat - auto-detect closest orientation
         return getCameraVectors(this, {
           useViewportNormal: true,
+        });
+      } else if (
+        orientation === OrientationAxis.AXIAL_REFORMAT ||
+        orientation === OrientationAxis.SAGITTAL_REFORMAT ||
+        orientation === OrientationAxis.CORONAL_REFORMAT
+      ) {
+        // Extract base orientation from reformat type
+        let baseOrientation: OrientationAxis;
+        if (orientation === OrientationAxis.AXIAL_REFORMAT) {
+          baseOrientation = OrientationAxis.AXIAL;
+        } else if (orientation === OrientationAxis.SAGITTAL_REFORMAT) {
+          baseOrientation = OrientationAxis.SAGITTAL;
+        } else {
+          baseOrientation = OrientationAxis.CORONAL;
+        }
+
+        // Use viewport normal (for reformat) but specify base orientation (for reference)
+        return getCameraVectors(this, {
+          useViewportNormal: true,
+          orientation: baseOrientation,
         });
       } else if (MPR_CAMERA_VALUES[orientation]) {
         this.viewportProperties.orientation = orientation;
@@ -2218,7 +2834,9 @@ abstract class BaseVolumeViewport extends Viewport {
     throw new Error(
       `Invalid orientation: ${orientation}. Valid orientations are: ${Object.keys(
         MPR_CAMERA_VALUES
-      ).join(', ')}`
+      ).join(
+        ', '
+      )}, ${OrientationAxis.ACQUISITION}, ${OrientationAxis.REFORMAT}, ${OrientationAxis.AXIAL_REFORMAT}, ${OrientationAxis.SAGITTAL_REFORMAT}, ${OrientationAxis.CORONAL_REFORMAT}`
     );
   }
 
@@ -2241,14 +2859,7 @@ abstract class BaseVolumeViewport extends Viewport {
       );
     }
 
-    const { direction } = imageVolume;
-    const viewPlaneNormal = direction.slice(6, 9).map((x) => -x) as Point3;
-    const viewUp = (direction.slice(3, 6) as Point3).map((x) => -x) as Point3;
-
-    return {
-      viewPlaneNormal,
-      viewUp,
-    };
+    return getAcquisitionPlaneOrientation(imageVolume);
   }
 
   /**
@@ -2267,6 +2878,19 @@ abstract class BaseVolumeViewport extends Viewport {
 
     return slabThickness;
   }
+
+  /**
+   * Get the geometric thickness in mm that an annotation applies to.
+   *
+   * This method does NOT return the slab thickness. `getSlabThickness` returns
+   * a half thickness on this render path, so this method doubles that value,
+   * and it maps the rendering minimum to undefined. See
+   * `docs/docs/concepts/cornerstone-tools/annotation/voxel-statistics.md`.
+   */
+  protected getReferencePlaneThickness(): number | undefined {
+    return getViewSlabDepth(this.getSlabThickness() * 2);
+  }
+
   /**
    * Given a point in world coordinates, return the intensity at that point
    * @param point - The point in world coordinates to get the intensity
@@ -2354,7 +2978,7 @@ abstract class BaseVolumeViewport extends Viewport {
    * allow using it as a parameter key.
    */
   public getViewReferenceId(specifier: ViewReferenceSpecifier = {}): string {
-    let { volumeId, sliceIndex: sliceIndex } = specifier;
+    let { volumeId, sliceIndex } = specifier;
     if (!volumeId) {
       const actorEntries = this.getActors();
       if (!actorEntries) {
@@ -2364,16 +2988,31 @@ abstract class BaseVolumeViewport extends Viewport {
       volumeId = actorEntries.find(
         (actorEntry) => actorEntry.actor.getClassName() === 'vtkVolume'
       )?.referencedId;
+      if (!volumeId) {
+        return;
+      }
     }
 
     const currentIndex = this.getSliceIndex();
     sliceIndex ??= currentIndex;
-    const { viewPlaneNormal, focalPoint } = this.getCamera();
-    const querySeparator = volumeId.includes('?') ? '&' : '?';
-    // Format each element of viewPlaneNormal to 3 decimal places
-    // to avoid floating point precision issues
-    const formattedNormal = viewPlaneNormal.map((v) => v.toFixed(3)).join(',');
-    return `volumeId:${volumeId}${querySeparator}sliceIndex=${sliceIndex}&viewPlaneNormal=${formattedNormal}`;
+    const { viewPlaneNormal } = this.getCamera();
+
+    return getVolumeViewReferenceId({
+      sliceIndex,
+      viewPlaneNormal,
+      volumeId,
+    });
+  }
+
+  /** The time point of a dynamic volume, or undefined for a 3D volume. */
+  private _getDimensionGroupNumber(
+    volumeId = this.getVolumeId()
+  ): number | undefined {
+    const volume =
+      volumeId && (cache.getVolume(volumeId) as IDynamicImageVolume);
+    return volume?.isDynamicVolume?.()
+      ? volume.dimensionGroupNumber
+      : undefined;
   }
 
   private _addVolumeId(volumeId: string): void {
@@ -2442,7 +3081,7 @@ abstract class BaseVolumeViewport extends Viewport {
 }
 
 /** Checks of a vector is compatible with the view plane normal */
-function isCompatible(viewPlaneNormal, vector) {
+function isCompatible(viewPlaneNormal: Point3, vector: Point3) {
   return !vector || isEqual(vec3.dot(viewPlaneNormal, vector), 0);
 }
 

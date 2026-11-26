@@ -17,6 +17,8 @@ const SUPPORTED_REGION_DATA_TYPES = [
 const SUPPORTED_PROBE_VARIANT = [
   '4,3', // x: seconds & y : cm
   '4,7', // x: seconds & y : cm/sec
+  '4,-1', // x: seconds & y : mV (ECG)
+  '-2,-1', // x: ms & y : mV (ECG)
 ];
 
 /**
@@ -35,6 +37,10 @@ const UNIT_MAPPING = {
   8: 'cm\xb2',
   9: 'cm\xb2/s',
   0xc: 'degrees',
+  /** Extension for ECG amplitude (not in DICOM table). */
+  [-1]: 'mV',
+  /** Extension for ECG time in milliseconds (not in DICOM table). */
+  [-2]: 'ms',
 };
 
 const EPS = 1e-3;
@@ -53,6 +59,10 @@ const types = [
 /**
  * Extracts the calibrated length units, area units, and the scale
  * for converting from internal spacing to image spacing.
+ *
+ * A region whose two axes have different units, for example an ECG region in
+ * ms and mV, gives no length calibration, so the length is in pixels.
+ * `UltrasoundDirectionalTool` measures along one axis of such a region.
  *
  * @param handles - to detect if spacing information is different between points
  * @param image - to extract the calibration from
@@ -100,21 +110,23 @@ const getCalibratedLengthUnitsAndScale = (image, handles) => {
             handle[0] <= region.regionLocationMaxX1 &&
             handle[1] >= region.regionLocationMinY0 &&
             handle[1] <= region.regionLocationMaxY1
-        ) && SUPPORTED_REGION_DATA_TYPES.includes(region.regionDataType)
+        ) &&
+        (SUPPORTED_REGION_DATA_TYPES.includes(region.regionDataType) ||
+          SUPPORTED_PROBE_VARIANT.includes(
+            `${region.physicalUnitsXDirection},${region.physicalUnitsYDirection}`
+          ))
     );
 
-    // If we are not in a region at all we should show the underlying calibration
-    // which might be the mm spacing for the image
     if (
       region &&
       region.physicalUnitsXDirection === region.physicalUnitsYDirection
     ) {
       const physicalDeltaX = Math.abs(region.physicalDeltaX);
       const physicalDeltaY = Math.abs(region.physicalDeltaY);
-
-      // 1 to 1 aspect ratio, we use just one of them
       scale = 1 / physicalDeltaX;
       scaleY = 1 / physicalDeltaY;
+
+      // 1 to 1 aspect ratio, we use just one of them
       calibrationType = 'US Region';
       unit = UNIT_MAPPING[region.physicalUnitsXDirection] || 'unknown';
       areaUnit = unit + SQUARE;
@@ -149,11 +161,13 @@ const getCalibratedProbeUnitsAndValue = (image, handles) => {
   }
 
   if (calibration.sequenceOfUltrasoundRegions) {
-    // for Probe tool
     const supportedRegionsMetadata =
       calibration.sequenceOfUltrasoundRegions.filter(
         (region) =>
-          SUPPORTED_REGION_DATA_TYPES.includes(region.regionDataType) &&
+          (SUPPORTED_REGION_DATA_TYPES.includes(region.regionDataType) ||
+            SUPPORTED_PROBE_VARIANT.includes(
+              `${region.physicalUnitsXDirection},${region.physicalUnitsYDirection}`
+            )) &&
           SUPPORTED_PROBE_VARIANT.includes(
             `${region.physicalUnitsXDirection},${region.physicalUnitsYDirection}`
           )
@@ -188,11 +202,12 @@ const getCalibratedProbeUnitsAndValue = (image, handles) => {
       (imageIndex[0] - region.regionLocationMinX0 - referencePixelX0) *
       physicalDeltaX;
 
-    calibrationType = 'US Region';
+    calibrationType =
+      region.physicalUnitsYDirection === -1 ? 'ECG Region' : 'US Region';
     values = [xValue, yValue];
     units = [
-      UNIT_MAPPING[region.physicalUnitsXDirection],
-      UNIT_MAPPING[region.physicalUnitsYDirection],
+      UNIT_MAPPING[region.physicalUnitsXDirection] ?? 'unknown',
+      UNIT_MAPPING[region.physicalUnitsYDirection] ?? 'unknown',
     ];
   }
 

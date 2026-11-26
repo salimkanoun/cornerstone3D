@@ -31,6 +31,10 @@ import type { ISculptToolShape } from '../types/ISculptToolShape';
 import { distancePointToContour } from './distancePointToContour';
 import { getToolGroupForViewport } from '../store/ToolGroupManager';
 import { getSignedArea, containsPoint } from '../utilities/math/polyline';
+import { utilities as cornerstoneUtilities } from '@cornerstonejs/core';
+
+const cs3dLogger =
+  cornerstoneUtilities.logger.toolsLog.getLogger('tools.SculptorTool');
 
 const { isEqual } = utilities;
 
@@ -99,6 +103,7 @@ class SculptorTool extends BaseTool {
         ],
         toolShape: 'circle',
         referencedToolName: 'PlanarFreehandROI',
+        updateCursorSize: 'dynamic',
       },
     }
   ) {
@@ -181,7 +186,6 @@ class SculptorTool extends BaseTool {
     if (!intersections.length) {
       return;
     }
-    // console.warn('intersections=', JSON.stringify(intersections, null, 2));
     const contourSelections = this.getContourSelections(
       intersections,
       points.length
@@ -211,7 +215,7 @@ class SculptorTool extends BaseTool {
       if (contourSelections.length > 1) {
         const signedArea = getSignedArea(newPoints.map(viewport.worldToCanvas));
         if (signedArea < 0) {
-          console.warn('Skipping internal area');
+          cs3dLogger.warn('Skipping internal area');
           continue;
         }
       }
@@ -355,12 +359,12 @@ class SculptorTool extends BaseTool {
     for (let enterCount = 0; enterCount < enterLength; enterCount++) {
       const enter = this.findNext(intersections, lastAngle);
       if (!enter) {
-        console.error("Couldnt' find an entry");
+        cs3dLogger.error("Couldnt' find an entry");
         continue;
       }
       const exit = this.findNext(intersections, enter.angle, false);
       if (!exit) {
-        console.error("Couldn't find an exit for", enter);
+        cs3dLogger.error("Couldn't find an exit for", enter);
         continue;
       }
       exit.relIndex ||=
@@ -381,7 +385,7 @@ class SculptorTool extends BaseTool {
     }
 
     if (result.length > 1) {
-      console.warn('************* More than 1 result', result);
+      cs3dLogger.warn('************* More than 1 result', result);
     }
 
     return result;
@@ -419,7 +423,7 @@ class SculptorTool extends BaseTool {
       }
     }
     if (!foundItem) {
-      console.warn(
+      cs3dLogger.warn(
         "Couldn't find an exit point for entry",
         JSON.stringify(intersections)
       );
@@ -490,7 +494,11 @@ class SculptorTool extends BaseTool {
     } else {
       const cursorShape = this.registeredShapes.get(this.selectedShape);
       const canvasCoords = eventData.currentPoints.canvas;
-      cursorShape.updateToolSize(canvasCoords, viewport, activeAnnotation);
+
+      // Only call updateToolSize when updateCursorSize is set to 'dynamic'
+      if (this.configuration.updateCursorSize === 'dynamic') {
+        cursorShape.updateToolSize(canvasCoords, viewport, activeAnnotation);
+      }
     }
 
     triggerAnnotationRenderForViewportIds(this.commonData.viewportIdsToRender);
